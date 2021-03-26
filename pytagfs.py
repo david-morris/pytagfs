@@ -11,19 +11,31 @@ import stat
 
 from optparse import OptionParser
 
-# TODO fix inconsistencies whenever
 # TODO handle deletions from file store
 # TODO disallow or strip . at begin or end of file/folder name.
 # TODO straighten out _store_path and _file_name
 
-# somehow self.contents is getting hit with empty string tag
-# Aha!  This happens on files added to the root of the mount.
+## constants and helpers
+def as_tags(path):
+    if path[-1] != '/':
+        path = path[:path.rindex('/')]
+    if len(path) < 2: # check for root/file in root.
+        return []
+    path = path.strip('/')
+    return [t.lstrip('.') for t in path.split("/")]
+
+def _file_name(path):
+    return path.split('/')[-1].strip('.')
+
 class Tagfs(Operations):
     def __init__(self, root):
         logging.info("init on "+ root)
         self.root = root
-        self.store = os.path.join(self.root, '.store')
+        self.store = os.path.join(self.root, 'store')
         # check to make sure we have a valid store structure
+        if not os.path.exists(self.store):
+            logging.info("Could not find actual store directory. Creating directory " + self.store)
+            os.mkdir(self.store)
         self.tags = SqliteDict(os.path.join(self.root, '.tags.sqlite'), autocommit=False)
         self.contents = SqliteDict(os.path.join(self.root, '.contents.sqlite'), autocommit=False)
 
@@ -32,17 +44,9 @@ class Tagfs(Operations):
         self.tags.commit()
         self.contents.commit()
 
-    def _file_name(path):
-        return path.split('/')[-1].strip('.')
 
     def _store_path(self, tag_path):
-        return os.path.join(self.store, tag_path.split('/')[-1].strip('.'))
-
-    def _full_path(self, partial):
-        if partial.startswith("/"):
-            partial = partial[1:]
-        path = os.path.join(self.root, partial)
-        return path
+        return os.path.join(self.store, tag_path.split('/')[-1].lstrip('.'))
 
     def access(self, path, mode):
         logging.info("API: access")
@@ -61,14 +65,24 @@ class Tagfs(Operations):
         logging.info("API: getattr")
         logging.debug("Path: " + path)
         perm = 0o777
-        # FIXME Detect and handle directories.
+        # we're going to lie about the number of hardlinks we have to path (st_nlinks). 
+        # internally, we should be able to get away with it because deleting tags should never delete media.
+
         if path[-1] == '/': # we have a directory
-            return {'st_mode': stat.S_IFDIR | perm, 'st_size': 0, 'st_blksize': 0,
-                    'st_atime': time.time(), 'st_ctime': time.time(), 'st_mtime': time.time()}
+            for tag in as_tags(path):
+                if tag not in self.contents.keys():
+                    return -errno.ENOENT
+            st = os.lstat(self.store)
+            return {key: getattr(st, key) for key in
+                    ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
+            return 
         full_path = self._store_path(path)
         st = os.lstat(full_path)
-        return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                     'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+        for tag in as_tags(path):
+            if tag not in self.contents.keys():
+                return -errno.ENOENT
+        return {key: getattr(st, key) for key in
+                ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
 
     def readdir(self, path, fh):
         '''Implements directory listing as a generator.
@@ -77,13 +91,18 @@ class Tagfs(Operations):
         members of other tags are hidden.  Existing tags will be shown if they
         contain some of those hidden members, otherwise hidden.'''
         logging.info("API: readdir")
-        tags = path.strip('/').split('/')
+        tags = as_tags(path)
         tset = set(tags)
         dirents = ['.', '..']
-        if tags.len == 1 and tags['0'] == '':
+        logging.debug("Contents:")
+        logging.debug(str(self.contents))
+        logging.debug("Tags:")
+        logging.debug(str(self.tags))
+        if len(tags) == 0:
             dirents.extend(['.' + d if len(self.contents[d]) == 0 else d
-                            for d in self.contents.keys()])
-            dirents.extend(['.' + f for f in os.listdir(self.store)])
+                            for d in self.tags.keys()])
+            dirents.extend(['.' + f if len(self.tags[f]) == 0 else f
+                            for f in os.listdir(self.store)])
         else:
             matches = set.intersection(*[self.contents[tag] for tag in tags])
             dirents.extend(['.' + d if len(self.contents[d].intersection(matches)) == 0
@@ -95,7 +114,7 @@ class Tagfs(Operations):
 
     def readlink(self, path):
         logging.info("API: readlink")
-        pathname = os.readlink(self._full_path(path))
+        pathname = os.readlink(self._store_path(path))
         if pathname.startswith("/"):
             # Path name is absolute, sanitize it.
             return os.path.relpath(pathname, self.root)
@@ -270,16 +289,28 @@ class Tagfs(Operations):
 
     def utimens(self, path, times=None):
         logging.info("API: utimens")
-        return os.utime(self._full_path(path), times)
+        return os.utime(self._store_path(path), times)
 
     # File methods
     # ============
 
     def open(self, path, flags):
         logging.info("API: open")
-        full_path = self._full_path(path)
-        return os.open(full_path, flags)
+        store_path = self._store_path(path)
+        return os.open(store_path, flags)
 
+    def create(self, path, mode):
+        logging.info("API: create")
+        logging.debug("path: " + path)
+        store_path = self._store_path(path)
+        tags = as_tags(path)
+        name = _file_name(path)
+        self.tags[name]=set(tags)
+        for tag in tags:
+            self.contents[tag].add(name)
+        self._flush_tags()
+        os.close(os.fdopen(store_path, os.O_WRONLY | os.O_CREAT, mode))
+        return 0
     # def create(self, path, mode, fi=None):
     #     full_path = self._full_path(path)
     #     # TODO handle tags!
@@ -297,7 +328,7 @@ class Tagfs(Operations):
 
     def truncate(self, path, length, fh=None):
         logging.info("API: truncate")
-        full_path = self._full_path(path)
+        full_path = self._store_path(path)
         with open(full_path, 'r+') as f:
             f.truncate(length)
 
@@ -314,9 +345,9 @@ class Tagfs(Operations):
         return self.flush(path, fh)
 
 
-def main(mountpoint, root):
+def main(mountpoint, root, options):
     logging.info("Mountpoint: "+ str(mountpoint)+ ", root: "+ str(root))
-    FUSE(Tagfs(root), mountpoint, nothreads=True, foreground=True)
+    FUSE(Tagfs(root), mountpoint, nothreads=True, foreground=True, **options)
 
 if __name__ == '__main__':
     parser = OptionParser()
@@ -326,8 +357,15 @@ if __name__ == '__main__':
                       help="mountpoint of the tag filesystem")
     parser.add_option("-d", "--datastore", dest="datastore",
                       help="Data store directory for the tag filesystem")
+    parser.add_option("-o", "--options", dest="fuse_options",
+                      help="FUSE filesystem options")
     options, args = parser.parse_args()
     if options.verbose:
         logging.root.setLevel(logging.DEBUG)
         logging.info("Verbose logging enabled.")
-    main(options.mountpoint, options.datastore)
+    if options.fuse_options is not None:
+        kwargs = {opt: True for opt in options.fuse_options.split(",")}
+        logging.info("FS options: " + str(kwargs))
+    else:
+        kwargs = {}
+    main(options.mountpoint, options.datastore, kwargs)
