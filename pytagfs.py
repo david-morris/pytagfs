@@ -16,7 +16,18 @@ from optparse import OptionParser
 # TODO straighten out _store_path and _file_name
 
 ## constants and helpers
-def as_tags(path):
+def dir_tags(path):
+    if len(path) < 2:
+        return []
+    return [t.lstrip('.') for t in path.strip('/').split('/')]
+
+def file_tags(path):
+    path = path[:path.rindex('/')]
+    if len(path) < 2:
+        return []
+    return [t.lstrip('.') for t in path.strip('/').split('/')]
+
+def guess_tags(path):
     if path[-1] != '/':
         path = path[:path.rindex('/')]
     if len(path) < 2: # check for root/file in root.
@@ -48,10 +59,30 @@ class Tagfs(Operations):
     def _store_path(self, tag_path):
         return os.path.join(self.store, tag_path.split('/')[-1].lstrip('.'))
 
+    def lock(self, path, cmd, length, fh):
+        logging.info("API: Locking " + path + ", cmd: " + str(cmd) + ", lock: " + str(lock) + ", fh: " + str(fh))
+        store_path = self._store_path(path)
+        if path[-1] == '/' or (not os.path.exists(store_path)):
+            raise FuseOSError(errno.ENOSYS) # let's see if we can get away with that.
+        else:
+            return os.lockf(fh, cmd, length)
+
+
     def access(self, path, mode):
-        logging.info("API: access")
-        if not os.access(self._store_path(path), mode):
-            raise FuseOSError(errno.EACCES)
+        # check if this is a directory
+        logging.info("API: access " + path + " " + oct(mode))
+        store_path = self._store_path(path)
+        logging.debug("store path: " + store_path)
+        if path[-1] == '/' or (not os.path.exists(store_path)):
+            for tag in dir_tags(path):
+                if tag not in self.contents.keys():
+                    raise FuseOSError(errno.ENOENT)
+            if not os.access(self.store, mode):
+                raise FuseOSError(errno.EACCES)
+        else:
+            if not os.access(self._store_path(path), mode):
+                raise FuseOSError(errno.EACCES)
+        logging.debug("Permission granted: " + path + " " + oct(mode))
 
     def chmod(self, path, mode):
         logging.info("API: chmod")
@@ -62,25 +93,24 @@ class Tagfs(Operations):
         return os.chown(self._store_path(path), uid, gid)
 
     def getattr(self, path, fh=None):
-        logging.info("API: getattr")
-        logging.debug("Path: " + path)
+        logging.info("API: getattr " + path)
         perm = 0o777
         # we're going to lie about the number of hardlinks we have to path (st_nlinks). 
         # internally, we should be able to get away with it because deleting tags should never delete media.
 
-        if path[-1] == '/': # we have a directory
-            for tag in as_tags(path):
+        full_path = self._store_path(path)
+        if path[-1] == '/' or (not os.path.exists(full_path)): # we (may) have a directory
+            for tag in dir_tags(path):
                 if tag not in self.contents.keys():
-                    return -errno.ENOENT
+                    raise FuseOSError(errno.ENOENT)
             st = os.lstat(self.store)
             return {key: getattr(st, key) for key in
                     ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
             return 
-        full_path = self._store_path(path)
         st = os.lstat(full_path)
-        for tag in as_tags(path):
+        for tag in file_tags(path):
             if tag not in self.contents.keys():
-                return -errno.ENOENT
+                raise FuseOSError(errno.ENOENT)
         return {key: getattr(st, key) for key in
                 ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
 
@@ -90,23 +120,24 @@ class Tagfs(Operations):
         Items matching all tags are listed.  Those which are additionally
         members of other tags are hidden.  Existing tags will be shown if they
         contain some of those hidden members, otherwise hidden.'''
-        logging.info("API: readdir")
-        tags = as_tags(path)
+        logging.info("API: readdir " + path)
+        tags = dir_tags(path)
+        logging.debug("Path as tags: " + str(tags))
+        for tag in tags:
+            if tag not in self.contents.keys():
+                raise FuseOSError(errno.ENOENT)
         tset = set(tags)
         dirents = ['.', '..']
-        logging.debug("Contents:")
-        logging.debug(str(self.contents))
-        logging.debug("Tags:")
-        logging.debug(str(self.tags))
+        logging.debug("Contents: " + str(dict(self.contents)))
+        logging.debug("Tags: " + str(dict(self.tags)))
         if len(tags) == 0:
-            dirents.extend(['.' + d if len(self.contents[d]) == 0 else d
-                            for d in self.tags.keys()])
-            dirents.extend(['.' + f if len(self.tags[f]) == 0 else f
+            dirents.extend(self.contents.keys())
+            dirents.extend([f if len(self.tags[f]) == 0 else '.' + f
                             for f in os.listdir(self.store)])
         else:
             matches = set.intersection(*[self.contents[tag] for tag in tags])
-            dirents.extend(['.' + d if len(self.contents[d].intersection(matches)) == 0
-                            else d for d in self.contents.keys()])
+            dirents.extend(['.' + d if len(self.contents[d].intersection(matches)) == 0 else d
+                            for d in self.contents.keys() if d not in tags])
             dirents.extend([f if tset == self.tags[f] else '.' + f
                             for f in matches])
         for r in dirents:
@@ -144,19 +175,19 @@ class Tagfs(Operations):
 
     def rmdir(self, path):
         '''Deletes an empty tag.'''
-        logging.info("API: rmdir")
+        logging.info("API: rmdir " + path)
         # check we don't have a leaf
         # if os.path.isfile(_store_path(path)):
         #     raise OSError(20, "Not a tag")
         tag = path.split('/')[-1].strip() # note: it better be hidden or we'll throw 39
         # check we are trying to delete a real tag
-        if tag not in contents.keys():
-            raise OSError(2, "No such tag")
+        if tag not in self.contents.keys():
+            raise FuseOSError(errno.ENOENT)
         # check that the tag has no members anywhere
-        if contents[tag] != set():
-            raise OSError(39, "Tag still applies to files")
+        if self.contents[tag] != set():
+            raise FuseOSError(errno.ENOTEMPTY)
         # remove it (it's not in any tags)
-        del contents[tag]
+        del self.contents[tag]
         # return none
         self._flush_tags()
 
@@ -223,49 +254,59 @@ class Tagfs(Operations):
         return retval
 
     def rename(self, old, new):
-        '''Changes the tag lists of a file.'''
-        logging.info("API: rename")
-        # FIXME clear up by rewriting entirely
-        path_parts_old = [x.strip() for x in old.split('/')]
-        path_parts_new = [x.strip() for x in new.split('/')]
-        # check to make sure the old file exists
-        if not os.path.isfile(self._store_path(old)):
-            raise OSError(2, "No such file")
-        # check to make sure the new name is the same or free
-        if path_parts_old[-1] != path_parts_new[-1] and os.path.isfile(self._store_path(new)):
-            raise OSError(38, "Overwriting disallowed")
-        # check to make sure the new name is not a directory
-        if path_parts_new[-1] in contents.keys():
-            raise OSError(21, "Can't replace a tag name with a file name.")
-        old_tags = set(path_parts_old[0:-1])
-        # check to make sure the old tags were accurate
-        for tag in old_tags:
-            if tag not in tags[path_parts_old[-1]]:
-                raise OSError(2, "Incorrect tags.")
-        new_tags = set(path_parts_new[0:-1])
-        # check to make sure the new tags all exist
-        for tag in new_tags:
-            if tag not in contents.keys():
-                raise OSError(2, "No such directory")
-        # check if we change the entry name
-        if path_parts_new[-1] != path_parts_old[-1]:
-            tags[path_parts_new[-1]] = new_tags
-            for tag in new_tags:
-                contents[tag].add(path_parts_new[-1])
-            for tag in old_tags:
-                contents[tag].remove(path_parts_old[-1])
-            del tags[path_parts_old[-1]]
-            return os.rename(self._store_path(old), self._store_path(new))
-        # compute tags to remove
-        name = path_parts_old[-1]
-        #tags[name] -= old_tags - new_tags
-        for tag in old_tags - new_tags:
-            contents[tag] -= name
-        # compute tags to add
-        tags[name] |= new_tags
-        for tag in new_tags - old_tags:
-            contents[tag].add(name)
-        self._flush_tags()
+        '''Changes the tag lists of a file, the name of a file, or the title of a tag.'''
+        logging.info("API: rename " + old + " to " + new)
+        old_name = _file_name(old)
+        new_name = _file_name(new)
+        # are we dealing with a file or a folder?
+        if old[-1] == '/' or not os.path.exists(self._store_path(old)):
+            # we are dealing with a (potentially bad) directory
+            logging.debug("renaming as directory")
+            old_tags = set(dir_tags(old))
+            new_tags = set(dir_tags(new))
+            if old_tags[-1] not in self.contents.keys():
+                raise FuseOSError(errno.ENOENT)
+            # if someone adds extra dirs after the one they want to change, that's not covered
+            for t_old, t_new in zip(old_tags[:-1], new_tags[:-1]):
+                if t_old != t_new:
+                    raise FuseOSError(errno.ENOSYS)
+            old_tag = old_tags[-1]
+            new_tag = new_tags[-1]
+            if new_tag in self.contents.keys():
+                raise FuseOSError(errno.EEXIST)
+            self.contents[new_tag] = self.contents.pop(old_tag)
+            for f in self.contents[new_tag]:
+                self.tags[f].remove(old_tag)
+                self.tags[f].add(new_tag)
+            self._flush_tags()
+        else:
+            logging.debug("renaming as file")
+            # handle taglist change
+            if (old_tags := set(file_tags(old))) != (new_tags := set(file_tags(new))):
+                removed_tags = old_tags - new_tags
+                added_tags = new_tags - old_tags
+                logging.debug("changing tags: " + str(list(old_tags)) + " - " + str(list(removed_tags)) +
+                                                    " + " + str(list(added_tags)) +
+                                                    " = " + str(list(new_tags)))
+                self.tags[old_name] = new_tags
+                for tag in removed_tags:
+                    self.contents[tag] = self.contents[tag] - {old_name}
+                for tag in added_tags:
+                    self.contents[tag] = self.contents[tag].union({old_name})
+                logging.debug("contents: " + str(dict(self.contents)))
+            # handle filename change
+            if old_name != new_name:
+                logging.debug("changing name")
+                old_path = self._store_path(old)
+                new_path = self._store_path(new)
+                os.rename(old_path, new_path)
+                self.tags[new_name] = self.tags.pop(old_name)
+                for tag in file_tags(new):
+                    self.contents[tag].remove(old_name)
+                    self.contents[tag].add(new_name)
+            self._flush_tags()
+
+        
 
     def link(self, target, name):
         '''Hardlink: union tags'''
@@ -295,29 +336,30 @@ class Tagfs(Operations):
     # ============
 
     def open(self, path, flags):
-        logging.info("API: open")
+        logging.info("API: open " + path)
         store_path = self._store_path(path)
         return os.open(store_path, flags)
 
     def create(self, path, mode):
-        logging.info("API: create")
-        logging.debug("path: " + path)
+        logging.info("API: create " + path)
         store_path = self._store_path(path)
-        tags = as_tags(path)
+        tags = file_tags(path)
         name = _file_name(path)
         self.tags[name]=set(tags)
         for tag in tags:
             self.contents[tag].add(name)
         self._flush_tags()
-        os.close(os.fdopen(store_path, os.O_WRONLY | os.O_CREAT, mode))
+        #os.close(os.fdopen(store_path, os.O_WRONLY | os.O_CREAT, mode))
+        os.close(os.open(store_path, os.O_WRONLY | os.O_CREAT, mode))
         return 0
+
     # def create(self, path, mode, fi=None):
     #     full_path = self._full_path(path)
     #     # TODO handle tags!
     #     return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
 
     def read(self, path, length, offset, fh):
-        logging.info("API: read")
+        logging.info("API: read " + path)
         os.lseek(fh, offset, os.SEEK_SET)
         return os.read(fh, length)
 
@@ -333,11 +375,11 @@ class Tagfs(Operations):
             f.truncate(length)
 
     def flush(self, path, fh):
-        logging.info("API: flush")
+        logging.info("API: flush " + path)
         return os.fsync(fh)
 
     def release(self, path, fh):
-        logging.info("API: release")
+        logging.info("API: release " + path)
         return os.close(fh)
 
     def fsync(self, path, fdatasync, fh):
@@ -351,18 +393,31 @@ def main(mountpoint, root, options):
 
 if __name__ == '__main__':
     parser = OptionParser()
-    parser.add_option("-v", "--verbose", action="store_true", dest="verbose", default=False,
+    parser.add_option("-v", "--verbose", action="count", dest="verbosity",
                       help="print information about interesting calls")
+    parser.add_option("-s", "--silent", action="store_true", dest="silent", default=False,
+                      help="do not print normal fusepy errors")
     parser.add_option("-m", "--mountpoint", dest="mountpoint",
                       help="mountpoint of the tag filesystem")
     parser.add_option("-d", "--datastore", dest="datastore",
                       help="Data store directory for the tag filesystem")
     parser.add_option("-o", "--options", dest="fuse_options",
                       help="FUSE filesystem options")
+    # parser.add_option("-w", "--windows-workaround", action="store_true", dest="win_hax", default=False,
+    #                  help="make a delete_tags folder with the tags ready for deletion")
     options, args = parser.parse_args()
-    if options.verbose:
-        logging.root.setLevel(logging.DEBUG)
-        logging.info("Verbose logging enabled.")
+    if options.verbosity > 0:
+        logging.root.setLevel(logging.INFO)
+        if options.verbosity > 1:
+            logging.root.setLevel(logging.DEBUG)
+        logging.info("Verbosity: "+ str(options.verbosity))
+    if options.silent:
+        class DevNull:
+            def write(self, msg):
+                pass
+        sys.stderr = DevNull()
+        sys.tracebacklimit = 0
+
     if options.fuse_options is not None:
         kwargs = {opt: True for opt in options.fuse_options.split(",")}
         logging.info("FS options: " + str(kwargs))
