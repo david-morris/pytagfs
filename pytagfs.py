@@ -39,9 +39,10 @@ def _file_name(path):
     return path.split('/')[-1].strip('.')
 
 class Tagfs(Operations):
-    def __init__(self, root):
+    def __init__(self, root, flat_delete):
         logging.info("init on "+ root)
         self.root = root
+        self.flat_delete = flat_delete
         self.store = os.path.join(self.root, 'store')
         # check to make sure we have a valid store structure
         if not os.path.exists(self.store):
@@ -200,22 +201,37 @@ class Tagfs(Operations):
             'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
             'f_frsize', 'f_namemax'))
 
-    def unlink(self, path): # what's this supposed to do?  How's it supposed to read mv's mind?
-        logging.info("API: unlink")
-        # check if the file exists
-        if not os.path.isfile(self._store_path(path)):
-            raise OSError(2, "No such file")
-        path_parts = [x.strip() for x in path.split('/')]
-        # check if we have a tagless item
-        if len(path_parts) == 1:
-            return os.unlink(self._store_path(path))
-        # check if we have the right tags
-        for tag in path_parts[0:-1]:
-            if tag not in self.tags[name]:
-                raise OSError(2, "File described with incorrect tags.")
-        # remove the last tag
-        tags[path_parts[-1]].remove(path_parts[-2])
-        contents[path_parts[-2]].remove(path_parts[-1])
+    def unlink(self, path):
+        logging.info("API: unlink " + path)
+        store_path = self._store_path(path)
+        name = _file_name(path)
+        if len(tags := file_tags(path)) != 0 and self.flat_delete:
+            tag = tags[-1]
+            self.tags[name] = self.tags[name] - {tag}
+            self.contents[tag] = self.contents[tag] - {name}
+            self._flush_tags()
+            return
+        os.unlink(store_path)
+        for tag in self.tags[name]:
+            self.contents[tag] = self.contents[tag] - {name}
+        del self.tags[name]
+        self._flush_tags()
+
+
+        # # check if the file exists
+        # if not os.path.isfile(self._store_path(path)):
+        #     raise FuseOSError(errno.ENOENT)
+        # path_parts = [x.strip() for x in path.split('/')]
+        # # check if we have a tagless item
+        # if len(path_parts) == 1:
+        #     return os.unlink(self._store_path(path))
+        # # check if we have the right tags
+        # for tag in path_parts[0:-1]:
+        #     if tag not in self.tags[name]:
+        #         raise FuseOSError(errno.ENOENT)
+        # # remove the last tag
+        # tags[path_parts[-1]].remove(path_parts[-2])
+        # contents[path_parts[-2]].remove(path_parts[-1])
 
     '''
 
@@ -262,8 +278,8 @@ class Tagfs(Operations):
         if old[-1] == '/' or not os.path.exists(self._store_path(old)):
             # we are dealing with a (potentially bad) directory
             logging.debug("renaming as directory")
-            old_tags = set(dir_tags(old))
-            new_tags = set(dir_tags(new))
+            old_tags = dir_tags(old)
+            new_tags = dir_tags(new)
             if old_tags[-1] not in self.contents.keys():
                 raise FuseOSError(errno.ENOENT)
             # if someone adds extra dirs after the one they want to change, that's not covered
@@ -347,11 +363,9 @@ class Tagfs(Operations):
         name = _file_name(path)
         self.tags[name]=set(tags)
         for tag in tags:
-            self.contents[tag].add(name)
+            self.contents[tag] = self.contents[tag].union({name})
         self._flush_tags()
-        #os.close(os.fdopen(store_path, os.O_WRONLY | os.O_CREAT, mode))
-        os.close(os.open(store_path, os.O_WRONLY | os.O_CREAT, mode))
-        return 0
+        return os.open(store_path, os.O_WRONLY | os.O_CREAT, mode)
 
     # def create(self, path, mode, fi=None):
     #     full_path = self._full_path(path)
@@ -387,9 +401,9 @@ class Tagfs(Operations):
         return self.flush(path, fh)
 
 
-def main(mountpoint, root, options):
+def main(mountpoint, root, options, flat_delete):
     logging.info("Mountpoint: "+ str(mountpoint)+ ", root: "+ str(root))
-    FUSE(Tagfs(root), mountpoint, nothreads=True, foreground=True, **options)
+    FUSE(Tagfs(root, flat_delete), mountpoint, nothreads=True, foreground=True, **options)
 
 if __name__ == '__main__':
     parser = OptionParser()
@@ -403,8 +417,8 @@ if __name__ == '__main__':
                       help="Data store directory for the tag filesystem")
     parser.add_option("-o", "--options", dest="fuse_options",
                       help="FUSE filesystem options")
-    # parser.add_option("-w", "--windows-workaround", action="store_true", dest="win_hax", default=False,
-    #                  help="make a delete_tags folder with the tags ready for deletion")
+    parser.add_option("-f", "--flat-delete", dest="flat_delete", action="store_true", default=False,
+                      help="only allow deletion in the root, so that windows doesn't recursively delete everything")
     options, args = parser.parse_args()
     if options.verbosity > 0:
         logging.root.setLevel(logging.INFO)
@@ -423,4 +437,4 @@ if __name__ == '__main__':
         logging.info("FS options: " + str(kwargs))
     else:
         kwargs = {}
-    main(options.mountpoint, options.datastore, kwargs)
+    main(options.mountpoint, options.datastore, kwargs, options.flat_delete)
