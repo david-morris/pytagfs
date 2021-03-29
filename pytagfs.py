@@ -1,19 +1,23 @@
 #!/usr/bin/env python
 import os
 import sys
+import fcntl
 import errno
 import time
 from sqlitedict import SqliteDict
 import logging
+import ctypes
+import asyncio
 
 from fuse import FUSE, FuseOSError, Operations
 import stat
+
+locker_mutex = asyncio.Lock()
 
 from optparse import OptionParser
 
 # TODO handle deletions from file store
 # TODO disallow or strip . at begin or end of file/folder name.
-# TODO straighten out _store_path and _file_name
 
 ## constants and helpers
 def dir_tags(path):
@@ -27,21 +31,34 @@ def file_tags(path):
         return []
     return [t.lstrip('.') for t in path.strip('/').split('/')]
 
-def guess_tags(path):
-    if path[-1] != '/':
-        path = path[:path.rindex('/')]
-    if len(path) < 2: # check for root/file in root.
-        return []
-    path = path.strip('/')
-    return [t.lstrip('.') for t in path.split("/")]
-
-def _file_name(path):
+def file_name(path):
     return path.split('/')[-1].strip('.')
 
+import sysconfig
+assert sysconfig.get_config_var('SIZEOF_OFF_T') == ctypes.sizeof(ctypes.c_long)
+assert sysconfig.get_config_var('SIZEOF_PID_T') == ctypes.sizeof(ctypes.c_int)
+
+class LOCK(ctypes.Structure): # some types fnctl uses are defined in sys/types.h and may be system dependent
+    _fields_ = [
+        ("l_type", ctypes.c_short),
+        ("l_whence", ctypes.c_short),
+        ("l_start", ctypes.c_long), # off_t
+        ("l_len", ctypes.c_long), # off_t
+        ("l_pid", ctypes.c_int)] # pid_t
+
+LOCK_P = ctypes.POINTER(LOCK)
+
+# def as_file_info(bytes):
+#     writepage, direct_io, keep_cache, flush, noonseekable,
+#     flock_release, cache_readdir, padding, padding2,
+#     fh, lock_owner, poll_events \
+#         = struct.unpack("IIIIIIIII
+
 class Tagfs(Operations):
-    def __init__(self, root):
+    def __init__(self, root, flat_delete):
         logging.info("init on "+ root)
         self.root = root
+        self.flat_delete = flat_delete
         self.store = os.path.join(self.root, 'store')
         # check to make sure we have a valid store structure
         if not os.path.exists(self.store):
@@ -55,17 +72,34 @@ class Tagfs(Operations):
         self.tags.commit()
         self.contents.commit()
 
+    def _consistent_file_path(self, path):
+        name = file_name(path)
+        tags = file_tags(path)
+        if path[path.rindex('/')+1] == '.':
+            return(name in self.tags.keys() and set(tags).issubset(self.tags[name]))
+        return(name in self.tags.keys() and set(tags) == self.tags[name])
 
     def _store_path(self, tag_path):
         return os.path.join(self.store, tag_path.split('/')[-1].lstrip('.'))
 
-    def lock(self, path, cmd, length, fh):
-        logging.info("API: Locking " + path + ", cmd: " + str(cmd) + ", lock: " + str(lock) + ", fh: " + str(fh))
-        store_path = self._store_path(path)
-        if path[-1] == '/' or (not os.path.exists(store_path)):
-            raise FuseOSError(errno.ENOSYS) # let's see if we can get away with that.
-        else:
-            return os.lockf(fh, cmd, length)
+    # def lock(self, path, fh, cmd, lock):
+    #     logging.info("API: lock" + path)
+    #     lock_handle = super().lock(path, fh, cmd, lock)
+    #     logging.debug(str(lock_handle))
+    #     return lock_handle
+        # ptr = ctypes.cast(lock, LOCK_P)
+        # logging.debug("fh: " + str(fh) + ", cmd: " + str(cmd)+ ", type: " + str(ptr.contents.l_type) +
+        #               ", whence: " + str(ptr.contents.l_whence) + ", start: " + str(ptr.contents.l_start) +
+        #               ", len: " + str(ptr.contents.l_len) + ", pid: " + str(ptr.contents.l_pid))
+        # store_path = self._store_path(path)
+        # if path[-1] == '/' or (not os.path.exists(store_path)):
+        #     raise FuseOSError(errno.ENOSYS) # let's see if we can get away with that.
+        # else:
+        #     if cmd == fcntl.F_SETLK:
+        #         lock_handle = fcntl.lockf(fh, fcntl.LOCK_SH, ptr.contents.l_len,
+        #                                   ptr.contents.l_start, ptr.contents.l_whence)
+        #         logging.debug(lock_handle)
+        #         return(lock_handle)
 
 
     def access(self, path, mode):
@@ -73,7 +107,8 @@ class Tagfs(Operations):
         logging.info("API: access " + path + " " + oct(mode))
         store_path = self._store_path(path)
         logging.debug("store path: " + store_path)
-        if path[-1] == '/' or (not os.path.exists(store_path)):
+        #if path[-1] == '/' or (not os.path.exists(store_path)):
+        if path[-1] == '/' or file_name(path) not in self.tags.keys():
             for tag in dir_tags(path):
                 if tag not in self.contents.keys():
                     raise FuseOSError(errno.ENOENT)
@@ -99,7 +134,8 @@ class Tagfs(Operations):
         # internally, we should be able to get away with it because deleting tags should never delete media.
 
         full_path = self._store_path(path)
-        if path[-1] == '/' or (not os.path.exists(full_path)): # we (may) have a directory
+        #if path[-1] == '/' or (not os.path.exists(full_path)): # we (may) have a directory
+        if path[-1] == '/' or file_name(path) not in self.tags.keys(): # we (may) have a directory
             for tag in dir_tags(path):
                 if tag not in self.contents.keys():
                     raise FuseOSError(errno.ENOENT)
@@ -107,10 +143,10 @@ class Tagfs(Operations):
             return {key: getattr(st, key) for key in
                     ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
             return 
+
         st = os.lstat(full_path)
-        for tag in file_tags(path):
-            if tag not in self.contents.keys():
-                raise FuseOSError(errno.ENOENT)
+        if not self._consistent_file_path(path):
+            raise FuseOSError(errno.ENOENT)
         return {key: getattr(st, key) for key in
                 ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
 
@@ -144,12 +180,15 @@ class Tagfs(Operations):
             yield r
 
     def readlink(self, path):
-        logging.info("API: readlink")
+        logging.info("API: readlink " + path)
         pathname = os.readlink(self._store_path(path))
-        if pathname.startswith("/"):
-            # Path name is absolute, sanitize it.
-            return os.path.relpath(pathname, self.root)
+        logging.debug("pathname " + pathname)
+        if pathname.startswith("/") or pathname.startswith("~"):
+            # Path name is absolute, allow it.
+            return pathname
+        #os.path.relpath(pathname, self.root)
         else:
+            # we'll have to edit this
             return pathname
 
     def mknod(self, path, mode, dev):
@@ -200,22 +239,37 @@ class Tagfs(Operations):
             'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
             'f_frsize', 'f_namemax'))
 
-    def unlink(self, path): # what's this supposed to do?  How's it supposed to read mv's mind?
-        logging.info("API: unlink")
-        # check if the file exists
-        if not os.path.isfile(self._store_path(path)):
-            raise OSError(2, "No such file")
-        path_parts = [x.strip() for x in path.split('/')]
-        # check if we have a tagless item
-        if len(path_parts) == 1:
-            return os.unlink(self._store_path(path))
-        # check if we have the right tags
-        for tag in path_parts[0:-1]:
-            if tag not in self.tags[name]:
-                raise OSError(2, "File described with incorrect tags.")
-        # remove the last tag
-        tags[path_parts[-1]].remove(path_parts[-2])
-        contents[path_parts[-2]].remove(path_parts[-1])
+    def unlink(self, path):
+        logging.info("API: unlink " + path)
+        store_path = self._store_path(path)
+        name = file_name(path)
+        if len(tags := file_tags(path)) != 0 and self.flat_delete:
+            tag = tags[-1]
+            self.tags[name] = self.tags[name] - {tag}
+            self.contents[tag] = self.contents[tag] - {name}
+            self._flush_tags()
+            return
+        os.unlink(store_path)
+        for tag in self.tags[name]:
+            self.contents[tag] = self.contents[tag] - {name}
+        del self.tags[name]
+        self._flush_tags()
+
+
+        # # check if the file exists
+        # if not os.path.isfile(self._store_path(path)):
+        #     raise FuseOSError(errno.ENOENT)
+        # path_parts = [x.strip() for x in path.split('/')]
+        # # check if we have a tagless item
+        # if len(path_parts) == 1:
+        #     return os.unlink(self._store_path(path))
+        # # check if we have the right tags
+        # for tag in path_parts[0:-1]:
+        #     if tag not in self.tags[name]:
+        #         raise FuseOSError(errno.ENOENT)
+        # # remove the last tag
+        # tags[path_parts[-1]].remove(path_parts[-2])
+        # contents[path_parts[-2]].remove(path_parts[-1])
 
     '''
 
@@ -233,37 +287,36 @@ class Tagfs(Operations):
     '''
 
     def symlink(self, name, target):
-        '''You shouldn't be symlinking inside of this filesystem.'''
-        logging.info("API: symlink")
-        # TODO add a check to see if we are trying to link inside this FS
-        # refuse to accept relative paths
+        '''Creates a symlink.  You shouldn't need as many inside this filesystem.'''
+        logging.info("API: symlink " + name + " to " + target)
+        # refuse to accept relative paths for now
         if target[0] != '/':
-            raise OSError(38, "Symlinks must be absolute")
-        # refuse to make a symlink to 2 points inside the tagfs
-        if target[0:size(self.root)] == self.root:
-            raise OSError(38, "No symlinking inside the tagfs")
+            raise FuseOSError(errno.ENOSYS)
         # make a stripped name symlink in the store
-        retval = os.symlink(target, self._store_path(name)) # errors here if there's something wrong with making that symlink
+        # errors here if there's something wrong with making that symlink
+        retval = os.symlink(target, self._store_path(name))
+        logging.debug("continuing after attempting to symlink with result " + str(retval))
         # add the tags we need
-        tags = [t.strip() for t in name.split('/')[0:-1]]
-        name = self._store_path(name)
+        tags = file_tags(name)
+        name = file_name(name)
         self.tags[name] = set(tags)
         for tag in tags:
-            self.contents[tag].add(name)
+            self.contents[tag] = self.contents[tag].union({name})
         self._flush_tags()
         return retval
 
     def rename(self, old, new):
         '''Changes the tag lists of a file, the name of a file, or the title of a tag.'''
         logging.info("API: rename " + old + " to " + new)
-        old_name = _file_name(old)
-        new_name = _file_name(new)
+        old_name = file_name(old)
+        new_name = file_name(new)
         # are we dealing with a file or a folder?
-        if old[-1] == '/' or not os.path.exists(self._store_path(old)):
+        #if old[-1] == '/' or not os.path.exists(self._store_path(old)):
+        if old[-1] == '/' or file_name(old) not in self.tags.keys():
             # we are dealing with a (potentially bad) directory
             logging.debug("renaming as directory")
-            old_tags = set(dir_tags(old))
-            new_tags = set(dir_tags(new))
+            old_tags = dir_tags(old)
+            new_tags = dir_tags(new)
             if old_tags[-1] not in self.contents.keys():
                 raise FuseOSError(errno.ENOENT)
             # if someone adds extra dirs after the one they want to change, that's not covered
@@ -282,7 +335,13 @@ class Tagfs(Operations):
         else:
             logging.debug("renaming as file")
             # handle taglist change
-            if (old_tags := set(file_tags(old))) != (new_tags := set(file_tags(new))):
+            if (from_tags := set(file_tags(old))) != (to_tags := set(file_tags(new))):
+                old_tags = self.tags[old_name]
+                if from_tags == {}:
+                    new_tags = old_tags.union(to_tags)
+                else:
+                    new_tags = to_tags
+
                 removed_tags = old_tags - new_tags
                 added_tags = new_tags - old_tags
                 logging.debug("changing tags: " + str(list(old_tags)) + " - " + str(list(removed_tags)) +
@@ -321,7 +380,7 @@ class Tagfs(Operations):
         # union
         sum_tags = old_tags.union(new_tags)
         # set contents
-        fname = _file_name(name)
+        fname = file_name(name)
         self.tags[fname] |= new_tags
         # set tags
         for tag in sum_tags:
@@ -338,20 +397,22 @@ class Tagfs(Operations):
     def open(self, path, flags):
         logging.info("API: open " + path)
         store_path = self._store_path(path)
-        return os.open(store_path, flags)
+        handle = os.open(store_path, flags)
+        logging.debug("Handle: " + str(handle))
+        return handle
 
     def create(self, path, mode):
         logging.info("API: create " + path)
         store_path = self._store_path(path)
         tags = file_tags(path)
-        name = _file_name(path)
+        name = file_name(path)
         self.tags[name]=set(tags)
         for tag in tags:
-            self.contents[tag].add(name)
+            self.contents[tag] = self.contents[tag].union({name})
         self._flush_tags()
-        #os.close(os.fdopen(store_path, os.O_WRONLY | os.O_CREAT, mode))
-        os.close(os.open(store_path, os.O_WRONLY | os.O_CREAT, mode))
-        return 0
+        handle = os.open(store_path, os.O_WRONLY | os.O_CREAT, mode)
+        logging.debug("Opened handle: " + str(handle))
+        return handle
 
     # def create(self, path, mode, fi=None):
     #     full_path = self._full_path(path)
@@ -387,9 +448,9 @@ class Tagfs(Operations):
         return self.flush(path, fh)
 
 
-def main(mountpoint, root, options):
+def main(mountpoint, root, options, flat_delete):
     logging.info("Mountpoint: "+ str(mountpoint)+ ", root: "+ str(root))
-    FUSE(Tagfs(root), mountpoint, nothreads=True, foreground=True, **options)
+    FUSE(Tagfs(root, flat_delete), mountpoint, nothreads=True, foreground=True, **options)
 
 if __name__ == '__main__':
     parser = OptionParser()
@@ -403,8 +464,8 @@ if __name__ == '__main__':
                       help="Data store directory for the tag filesystem")
     parser.add_option("-o", "--options", dest="fuse_options",
                       help="FUSE filesystem options")
-    # parser.add_option("-w", "--windows-workaround", action="store_true", dest="win_hax", default=False,
-    #                  help="make a delete_tags folder with the tags ready for deletion")
+    parser.add_option("-f", "--flat-delete", dest="flat_delete", action="store_true", default=False,
+                      help="only allow deletion in the root, so that windows doesn't recursively delete everything")
     options, args = parser.parse_args()
     if options.verbosity > 0:
         logging.root.setLevel(logging.INFO)
@@ -423,4 +484,4 @@ if __name__ == '__main__':
         logging.info("FS options: " + str(kwargs))
     else:
         kwargs = {}
-    main(options.mountpoint, options.datastore, kwargs)
+    main(options.mountpoint, options.datastore, kwargs, options.flat_delete)
