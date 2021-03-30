@@ -9,25 +9,30 @@ PyTagFS is intended as a proof-of-concept for a tag-based filesystem. In this st
     - [x] Create
       - [x] In the root folder
       - [x] In tags
+      - [ ] Including symlinks
     - [x] Read
     - [x] Update
       - [x] Overwrite
       - [x] Move
         - [x] Out of the root directory
         - [x] Out of a subdirectory
+        - [x] including renaming tags
     - [x] Delete
   - [ ] Must work with file managers and over SMB
     - [x] Create
     - [x] Read
     - [x] Update
-    - [ ] Delete
+    - [x] Delete
+    - [ ] read symlinks
 - [ ] Odds and Ends
   - [ ] getxattr
   - [ ] symlinks
-    - [ ] absolute path
-    - [ ] magic files to handle being read from different paths
+    - [x] absolute path
+    - [x] handle being read from different paths
   - [ ] clean up spurious dialogs over SMB
   - [ ] hide empty 'subdirectories'
+  - [ ] make a workaround for windows deleting tags
+  - [ ] consider giving folders their own inodes or otherwise managing permissions, attrs, xattrs
 - [ ] Better backend
   - [ ] Switch to SQLite without a wrapper
   - [ ] Write ACID consistency guarantees

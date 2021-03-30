@@ -34,30 +34,11 @@ def file_tags(path):
 def file_name(path):
     return path.split('/')[-1].strip('.')
 
-import sysconfig
-assert sysconfig.get_config_var('SIZEOF_OFF_T') == ctypes.sizeof(ctypes.c_long)
-assert sysconfig.get_config_var('SIZEOF_PID_T') == ctypes.sizeof(ctypes.c_int)
-
-class LOCK(ctypes.Structure): # some types fnctl uses are defined in sys/types.h and may be system dependent
-    _fields_ = [
-        ("l_type", ctypes.c_short),
-        ("l_whence", ctypes.c_short),
-        ("l_start", ctypes.c_long), # off_t
-        ("l_len", ctypes.c_long), # off_t
-        ("l_pid", ctypes.c_int)] # pid_t
-
-LOCK_P = ctypes.POINTER(LOCK)
-
-# def as_file_info(bytes):
-#     writepage, direct_io, keep_cache, flush, noonseekable,
-#     flock_release, cache_readdir, padding, padding2,
-#     fh, lock_owner, poll_events \
-#         = struct.unpack("IIIIIIIII
-
 class Tagfs(Operations):
-    def __init__(self, root, flat_delete):
+    def __init__(self, root, mount, flat_delete):
         logging.info("init on "+ root)
         self.root = root
+        self.mount = mount
         self.flat_delete = flat_delete
         self.store = os.path.join(self.root, 'store')
         # check to make sure we have a valid store structure
@@ -67,10 +48,13 @@ class Tagfs(Operations):
         self.tags = SqliteDict(os.path.join(self.root, '.tags.sqlite'), autocommit=False)
         self.contents = SqliteDict(os.path.join(self.root, '.contents.sqlite'), autocommit=False)
 
+    def __del__(self):
+        self._flush_tags()
+
     def _flush_tags(self):
-        logging.info("flushing tags and contents")
         self.tags.commit()
         self.contents.commit()
+        logging.info("flushed tags and contents")
 
     def _consistent_file_path(self, path):
         name = file_name(path)
@@ -82,32 +66,22 @@ class Tagfs(Operations):
     def _store_path(self, tag_path):
         return os.path.join(self.store, tag_path.split('/')[-1].lstrip('.'))
 
-    # def lock(self, path, fh, cmd, lock):
-    #     logging.info("API: lock" + path)
-    #     lock_handle = super().lock(path, fh, cmd, lock)
-    #     logging.debug(str(lock_handle))
-    #     return lock_handle
-        # ptr = ctypes.cast(lock, LOCK_P)
-        # logging.debug("fh: " + str(fh) + ", cmd: " + str(cmd)+ ", type: " + str(ptr.contents.l_type) +
-        #               ", whence: " + str(ptr.contents.l_whence) + ", start: " + str(ptr.contents.l_start) +
-        #               ", len: " + str(ptr.contents.l_len) + ", pid: " + str(ptr.contents.l_pid))
-        # store_path = self._store_path(path)
-        # if path[-1] == '/' or (not os.path.exists(store_path)):
-        #     raise FuseOSError(errno.ENOSYS) # let's see if we can get away with that.
-        # else:
-        #     if cmd == fcntl.F_SETLK:
-        #         lock_handle = fcntl.lockf(fh, fcntl.LOCK_SH, ptr.contents.l_len,
-        #                                   ptr.contents.l_start, ptr.contents.l_whence)
-        #         logging.debug(lock_handle)
-        #         return(lock_handle)
-
+    def getxattr(self, path, name, *args):
+        logging.info("API: getxattr " + path + ", " + str(name) + ", " +str(args))
+        if path == '/' or path.split('/')[-1].strip('.') in self.contents.keys():
+            if set(dir_tags(path)).issubset(set(self.contents.keys())):
+                return os.getxattr(self.store, name, *args)
+            else:
+                raise FuseOSError(errno.ENOENT)
+        if not self._consistent_file_path(path):
+            raise FuseOSError(errno.ENOENT)
+        return os.getxattr(self._store_path(path), name, *args)
 
     def access(self, path, mode):
         # check if this is a directory
         logging.info("API: access " + path + " " + oct(mode))
         store_path = self._store_path(path)
         logging.debug("store path: " + store_path)
-        #if path[-1] == '/' or (not os.path.exists(store_path)):
         if path[-1] == '/' or file_name(path) not in self.tags.keys():
             for tag in dir_tags(path):
                 if tag not in self.contents.keys():
@@ -134,7 +108,6 @@ class Tagfs(Operations):
         # internally, we should be able to get away with it because deleting tags should never delete media.
 
         full_path = self._store_path(path)
-        #if path[-1] == '/' or (not os.path.exists(full_path)): # we (may) have a directory
         if path[-1] == '/' or file_name(path) not in self.tags.keys(): # we (may) have a directory
             for tag in dir_tags(path):
                 if tag not in self.contents.keys():
@@ -181,15 +154,18 @@ class Tagfs(Operations):
 
     def readlink(self, path):
         logging.info("API: readlink " + path)
-        pathname = os.readlink(self._store_path(path))
-        logging.debug("pathname " + pathname)
-        if pathname.startswith("/") or pathname.startswith("~"):
-            # Path name is absolute, allow it.
-            return pathname
-        #os.path.relpath(pathname, self.root)
+        read_dir = os.path.join(self.mount, '/'.join(file_tags(path)))
+        logging.debug("raw link: " + os.readlink(self._store_path(path)))
+        logging.debug("read dir: " + read_dir)
+        path_from_store = os.readlink(self._store_path(path))
+        if path_from_store[0] == '/':
+            pathname = path_from_store
         else:
-            # we'll have to edit this
-            return pathname
+            #pathname = os.path.join("../"*(read_dir.count('/')), self.store, path_from_store)
+            pathname = os.path.join(os.path.relpath(self.store, read_dir),
+                                    path_from_store)
+        logging.debug("pathname: " + pathname)
+        return pathname
 
     def mknod(self, path, mode, dev):
         logging.info("API: mknod")
@@ -255,45 +231,14 @@ class Tagfs(Operations):
         del self.tags[name]
         self._flush_tags()
 
-
-        # # check if the file exists
-        # if not os.path.isfile(self._store_path(path)):
-        #     raise FuseOSError(errno.ENOENT)
-        # path_parts = [x.strip() for x in path.split('/')]
-        # # check if we have a tagless item
-        # if len(path_parts) == 1:
-        #     return os.unlink(self._store_path(path))
-        # # check if we have the right tags
-        # for tag in path_parts[0:-1]:
-        #     if tag not in self.tags[name]:
-        #         raise FuseOSError(errno.ENOENT)
-        # # remove the last tag
-        # tags[path_parts[-1]].remove(path_parts[-2])
-        # contents[path_parts[-2]].remove(path_parts[-1])
-
-    '''
-
-    def unlink (self, path): 
-        name = path.split('/')[-1].strip()
-        # check if the file exists
-        if not os.path.isfile(self._store_path(path)):
-            raise OSError(2, "No such file")
-        # clean it away
-        for tag in tags[name]:
-            contents[tag].remove(name)
-        del tags[name]
-        self._flush_tags()
-        return os.unlink(self._store_path(path))
-    '''
-
     def symlink(self, name, target):
         '''Creates a symlink.  You shouldn't need as many inside this filesystem.'''
         logging.info("API: symlink " + name + " to " + target)
-        # refuse to accept relative paths for now
-        if target[0] != '/':
-            raise FuseOSError(errno.ENOSYS)
         # make a stripped name symlink in the store
         # errors here if there's something wrong with making that symlink
+        if target[0] != '/':
+            target = os.path.join(os.path.relpath(self.mount, self.store),
+                                  target)
         retval = os.symlink(target, self._store_path(name))
         logging.debug("continuing after attempting to symlink with result " + str(retval))
         # add the tags we need
@@ -329,8 +274,8 @@ class Tagfs(Operations):
                 raise FuseOSError(errno.EEXIST)
             self.contents[new_tag] = self.contents.pop(old_tag)
             for f in self.contents[new_tag]:
-                self.tags[f].remove(old_tag)
-                self.tags[f].add(new_tag)
+                self.tags[f] = self.tags[f] - {old_tag}
+                self.tags[f] = self.tags[f].union({new_tag})
             self._flush_tags()
         else:
             logging.debug("renaming as file")
@@ -388,11 +333,8 @@ class Tagfs(Operations):
         self._flush_tags()
 
     def utimens(self, path, times=None):
-        logging.info("API: utimens")
+        logging.info("API: utimens " + path)
         return os.utime(self._store_path(path), times)
-
-    # File methods
-    # ============
 
     def open(self, path, flags):
         logging.info("API: open " + path)
@@ -414,23 +356,18 @@ class Tagfs(Operations):
         logging.debug("Opened handle: " + str(handle))
         return handle
 
-    # def create(self, path, mode, fi=None):
-    #     full_path = self._full_path(path)
-    #     # TODO handle tags!
-    #     return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
-
     def read(self, path, length, offset, fh):
         logging.info("API: read " + path)
         os.lseek(fh, offset, os.SEEK_SET)
         return os.read(fh, length)
 
     def write(self, path, buf, offset, fh):
-        logging.info("API: write")
+        logging.info("API: write to " + path)
         os.lseek(fh, offset, os.SEEK_SET)
         return os.write(fh, buf)
 
     def truncate(self, path, length, fh=None):
-        logging.info("API: truncate")
+        logging.info("API: truncate " + path + ", len: " + str(length))
         full_path = self._store_path(path)
         with open(full_path, 'r+') as f:
             f.truncate(length)
@@ -444,13 +381,13 @@ class Tagfs(Operations):
         return os.close(fh)
 
     def fsync(self, path, fdatasync, fh):
-        logging.info("API: fsync")
+        logging.info("API: fsync " + path)
         return self.flush(path, fh)
 
 
 def main(mountpoint, root, options, flat_delete):
     logging.info("Mountpoint: "+ str(mountpoint)+ ", root: "+ str(root))
-    FUSE(Tagfs(root, flat_delete), mountpoint, nothreads=True, foreground=True, **options)
+    FUSE(Tagfs(root, mountpoint, flat_delete), mountpoint, nothreads=True, foreground=True, **options)
 
 if __name__ == '__main__':
     parser = OptionParser()
