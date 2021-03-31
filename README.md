@@ -1,7 +1,6 @@
 # PyTagFS
 PyTagFS is a tag-based filesystem written in Python.
 
-<<<<<<< HEAD
 This is early beta software. EXPECT IT TO LOSE YOUR DATA. I only put symlinks in, so my actual files stay safe.
 
 
@@ -69,36 +68,5 @@ Coming Soon: Installation via pip.
   - [ ] Switch to SQLite without a wrapper
   - [ ] Write ACID consistency guarantees
   - [ ] Consider turning files into sqlite blobs
-=======
-PyTagFS is intended as a proof-of-concept for a tag-based filesystem. In this stage of development, expect data loss.
-
-## Wish List
-- [ ] Basic functionality
-  - [x] CRUD operations
-    - [x] Create
-      - [x] In the root folder
-      - [x] In tags
-    - [x] Read
-    - [x] Update
-      - [x] Overwrite
-      - [x] Move
-        - [x] Out of the root directory
-        - [x] Out of a subdirectory
-    - [x] Delete
-  - [ ] Must work with file managers and over SMB
-    - [x] Create
-    - [x] Read
-    - [ ] Update
-    - [ ] Delete
-- [ ] Odds and Ends
-  - [ ] getxattr
-  - [ ] symlinks
-- [ ] Better backend
-  - [ ] Switch to SQLite without a wrapper
-  - [ ] Write ACID consistency guarantees
-  - [ ] Make operations atomic
-  - [ ] Make commits tuneable
-  - [ ] Turn files into sqlite blobs
->>>>>>> f3966b89ae5a52257929f5f054d2016ce38651a0
 - [ ] Possible reimplementation
   - [ ] Rust seems like a good target
