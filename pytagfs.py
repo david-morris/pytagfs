@@ -13,9 +13,6 @@ import stat
 
 from optparse import OptionParser
 
-# TODO handle deletions from file store
-# TODO disallow or strip . at begin or end of file/folder name.
-
 ## constants and helpers
 def dir_tags(path):
     if len(path) < 2:
@@ -32,16 +29,10 @@ def file_name(path):
     return path.split('/')[-1].strip('.')
 
 class Tagfs(Operations):
-<<<<<<< HEAD
     def __init__(self, root, mount, flat_delete):
         logging.info("init on "+ root)
         self.root = root
         self.mount = mount
-=======
-    def __init__(self, root, flat_delete):
-        logging.info("init on "+ root)
-        self.root = root
->>>>>>> f3966b89ae5a52257929f5f054d2016ce38651a0
         self.flat_delete = flat_delete
         self.store = os.path.join(self.root, 'store')
         # check to make sure we have a valid store structure
@@ -222,11 +213,7 @@ class Tagfs(Operations):
     def unlink(self, path):
         logging.info("API: unlink " + path)
         store_path = self._store_path(path)
-<<<<<<< HEAD
         name = file_name(path)
-=======
-        name = _file_name(path)
->>>>>>> f3966b89ae5a52257929f5f054d2016ce38651a0
         if len(tags := file_tags(path)) != 0 and self.flat_delete:
             tag = tags[-1]
             self.tags[name] = self.tags[name] - {tag}
@@ -237,38 +224,6 @@ class Tagfs(Operations):
         for tag in self.tags[name]:
             self.contents[tag] = self.contents[tag] - {name}
         del self.tags[name]
-<<<<<<< HEAD
-=======
-        self._flush_tags()
-
-
-        # # check if the file exists
-        # if not os.path.isfile(self._store_path(path)):
-        #     raise FuseOSError(errno.ENOENT)
-        # path_parts = [x.strip() for x in path.split('/')]
-        # # check if we have a tagless item
-        # if len(path_parts) == 1:
-        #     return os.unlink(self._store_path(path))
-        # # check if we have the right tags
-        # for tag in path_parts[0:-1]:
-        #     if tag not in self.tags[name]:
-        #         raise FuseOSError(errno.ENOENT)
-        # # remove the last tag
-        # tags[path_parts[-1]].remove(path_parts[-2])
-        # contents[path_parts[-2]].remove(path_parts[-1])
-
-    '''
-
-    def unlink (self, path): 
-        name = path.split('/')[-1].strip()
-        # check if the file exists
-        if not os.path.isfile(self._store_path(path)):
-            raise OSError(2, "No such file")
-        # clean it away
-        for tag in tags[name]:
-            contents[tag].remove(name)
-        del tags[name]
->>>>>>> f3966b89ae5a52257929f5f054d2016ce38651a0
         self._flush_tags()
 
     def symlink(self, name, target):
@@ -395,19 +350,9 @@ class Tagfs(Operations):
         for tag in tags:
             self.contents[tag] = self.contents[tag].union({name})
         self._flush_tags()
-<<<<<<< HEAD
         handle = os.open(store_path, os.O_WRONLY | os.O_CREAT, mode)
         logging.debug("Opened handle: " + str(handle))
         return handle
-=======
-        return os.open(store_path, os.O_WRONLY | os.O_CREAT, mode)
-
-    # def create(self, path, mode, fi=None):
-    #     full_path = self._full_path(path)
-    #     # TODO handle tags!
-    #     return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
->>>>>>> f3966b89ae5a52257929f5f054d2016ce38651a0
-
     def read(self, path, length, offset, fh):
         logging.info("API: read " + path)
         os.lseek(fh, offset, os.SEEK_SET)
@@ -439,11 +384,7 @@ class Tagfs(Operations):
 
 def main(mountpoint, root, options, flat_delete):
     logging.info("Mountpoint: "+ str(mountpoint)+ ", root: "+ str(root))
-<<<<<<< HEAD
     FUSE(Tagfs(root, mountpoint, flat_delete), mountpoint, nothreads=True, foreground=True, **options)
-=======
-    FUSE(Tagfs(root, flat_delete), mountpoint, nothreads=True, foreground=True, **options)
->>>>>>> f3966b89ae5a52257929f5f054d2016ce38651a0
 
 if __name__ == '__main__':
     parser = OptionParser()
@@ -457,13 +398,8 @@ if __name__ == '__main__':
                       help="Data store directory for the tag filesystem")
     parser.add_option("-o", "--options", dest="fuse_options",
                       help="FUSE filesystem options")
-<<<<<<< HEAD
     parser.add_option("-a", "--anywhere-delete", dest="flat_delete", action="store_false", default=True,
                       help="allow deletion anywhere, instead of just in the root of the fileystem")
-=======
-    parser.add_option("-f", "--flat-delete", dest="flat_delete", action="store_true", default=False,
-                      help="only allow deletion in the root, so that windows doesn't recursively delete everything")
->>>>>>> f3966b89ae5a52257929f5f054d2016ce38651a0
     options, args = parser.parse_args()
     if options.verbosity > 0:
         logging.root.setLevel(logging.INFO)
