@@ -7,12 +7,9 @@ import time
 from sqlitedict import SqliteDict
 import logging
 import ctypes
-import asyncio
 
 from fuse import FUSE, FuseOSError, Operations
 import stat
-
-locker_mutex = asyncio.Lock()
 
 from optparse import OptionParser
 
@@ -164,6 +161,7 @@ class Tagfs(Operations):
             #pathname = os.path.join("../"*(read_dir.count('/')), self.store, path_from_store)
             pathname = os.path.join(os.path.relpath(self.store, read_dir),
                                     path_from_store)
+            pathname = os.path.normpath(pathname)
         logging.debug("pathname: " + pathname)
         return pathname
 
@@ -270,6 +268,9 @@ class Tagfs(Operations):
                     raise FuseOSError(errno.ENOSYS)
             old_tag = old_tags[-1]
             new_tag = new_tags[-1]
+            if len(old_tags) == 1 and new == "/..deleteme": # magic dir name to delete a tag from windows
+                self.rmdir(old)
+                return
             if new_tag in self.contents.keys():
                 raise FuseOSError(errno.EEXIST)
             self.contents[new_tag] = self.contents.pop(old_tag)
@@ -282,7 +283,7 @@ class Tagfs(Operations):
             # handle taglist change
             if (from_tags := set(file_tags(old))) != (to_tags := set(file_tags(new))):
                 old_tags = self.tags[old_name]
-                if from_tags == {}:
+                if from_tags == set() or old.split('/')[-1][0] == ".":
                     new_tags = old_tags.union(to_tags)
                 else:
                     new_tags = to_tags
@@ -391,18 +392,18 @@ def main(mountpoint, root, options, flat_delete):
 
 if __name__ == '__main__':
     parser = OptionParser()
-    parser.add_option("-v", "--verbose", action="count", dest="verbosity",
+    parser.add_option("-v", "--verbose", action="count", dest="verbosity", default=0,
                       help="print information about interesting calls")
-    parser.add_option("-s", "--silent", action="store_true", dest="silent", default=False,
-                      help="do not print normal fusepy errors")
+    parser.add_option("-s", "--show_fusepy_errors", action="store_false", dest="silent", default=True,
+                      help="print normal fusepy errors without high verbosity")
     parser.add_option("-m", "--mountpoint", dest="mountpoint",
                       help="mountpoint of the tag filesystem")
     parser.add_option("-d", "--datastore", dest="datastore",
                       help="Data store directory for the tag filesystem")
     parser.add_option("-o", "--options", dest="fuse_options",
                       help="FUSE filesystem options")
-    parser.add_option("-f", "--flat-delete", dest="flat_delete", action="store_true", default=False,
-                      help="only allow deletion in the root, so that windows doesn't recursively delete everything")
+    parser.add_option("-a", "--anywhere-delete", dest="flat_delete", action="store_false", default=True,
+                      help="allow deletion anywhere, instead of just in the root of the fileystem")
     options, args = parser.parse_args()
     if options.verbosity > 0:
         logging.root.setLevel(logging.INFO)
