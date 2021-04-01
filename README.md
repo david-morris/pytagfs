@@ -53,9 +53,7 @@ Empty tags can be deleted with `rmdir`. If your file manager refuses to try to d
 ## Installation
 Requirements: FUSE. That means pytagfs only supports Unix-like systems.
 
-Pip requirements: fusepy
-
-Coming Soon: Installation via pip.
+```pip install pytagfs```
 
 
 ## Wish List
