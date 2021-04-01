@@ -1,16 +1,16 @@
 # PyTagFS
-PyTagFS is a tag-based filesystem written in Python.
+PyTagFS is a tag-based filesystem written in Python. It's intended for organizing diverse media collections.
 
 This is early beta software. EXPECT IT TO LOSE YOUR DATA. I only put symlinks in, so my actual files stay safe.
 
-
+This is an unusual file system, which might cause file managers to make more low-level filesystem calls than usual, which may increase disk wear.
 ## Usage
 
 Start pytagfs with:
 ```$ pytagfs -m <mountpoint> -d <datastore folder> [-o <comma-separated filesystem args>] [<flag>...]```
 Make sure that `mountpoint` and `datastore folder` refer to folders which exist, that the datastore folder is not inside the mountpoint, and is empty the first time you run the command.
 
-For most usage, you shouldn't need any flags other than maybe `-o allow_other` if you are sharing the filesystem over SMB. Please collect logs with the `-v` and then `-vv` options and raise an issue if you notice something that doesn't work the way it should.
+For most usage, you shouldn't need any flags other than maybe `-o allow_other` if you are sharing the filesystem over SMB. Please collect logs with the `-v -s` and then `-vv` options and raise an issue if you notice something that doesn't work the way it should.
 
 ### Basic Usage
 
@@ -53,7 +53,7 @@ Empty tags can be deleted with `rmdir`. If your file manager refuses to try to d
 ## Installation
 Requirements: FUSE. That means pytagfs only supports Unix-like systems.
 
-Pip requirements: fusepy, sqlitedict
+Pip requirements: fusepy
 
 Coming Soon: Installation via pip.
 
@@ -63,10 +63,8 @@ Coming Soon: Installation via pip.
   - [x] CRUD operations
   - [x] Must work with file managers and over SMB
 - [ ] Odds and Ends
-  - [ ] consider giving tags their own inodes or otherwise managing permissions, attrs, xattrs
-- [ ] Better backend
-  - [ ] Switch to SQLite without a wrapper
-  - [ ] Write ACID consistency guarantees
+  - [ ] Add options to limit the number of hidden files you list (for large media collections).
+  - [ ] Consider giving tags their own inodes or otherwise managing permissions, attrs, xattrs
   - [ ] Consider turning files into sqlite blobs
 - [ ] Possible reimplementation
   - [ ] Rust seems like a good target
