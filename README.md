@@ -1,5 +1,5 @@
 # PyTagFS
-PyTagFS is a tag-based filesystem written in Python. It's intended for organizing diverse media collections.
+PyTagFS is a tag-based filesystem written in Python. Instead of directories being 'containers,' they represent attributes, so they can be accessed in any order. It's intended for organizing diverse media collections.  You'll never forget whether you put that picture of a sunset with a whale breaching in `~/Pictures/landscapes/sunsets` or `~/Pictures/animals/wild` again!
 
 This is early beta software. EXPECT IT TO LOSE YOUR DATA. I only put symlinks in, so my actual files stay safe.
 
@@ -28,7 +28,7 @@ Stopping or restarting a FUSE mountpoint locks up any shells currently working i
 
 ### Hidden Files
 
-A file is hidden when your path does not include all their tags, but all tags in your path do apply to the file. When your path contains exactly the tags of a file, it is shown non-hidden.
+A file is hidden when your path does not include all their tags, but all tags in your path do apply to the file. When your path contains exactly the tags of a file, it is shown non-hidden. This is because most file managers let you quickly toggle whether hidden files are shown, so you can use that property to quickly see if you have all the tags you want on a specific file or files.
 
 A tag is hidden when adding it to your path would mean you have no more matching files. However, tags are never hidden directly inside the mountpoint.
 
@@ -66,5 +66,6 @@ Coming Soon: Installation via pip.
   - [ ] Add options to limit the number of hidden files you list (for large media collections).
   - [ ] Consider giving tags their own inodes or otherwise managing permissions, attrs, xattrs
   - [ ] Consider turning files into sqlite blobs
+  - [ ] If you have experience with SQL, consider checking over my queries.
 - [ ] Possible reimplementation
   - [ ] Rust seems like a good target
