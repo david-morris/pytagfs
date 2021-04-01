@@ -84,10 +84,11 @@ class Tagfs(Operations):
         if self.con.execute("SELECT 1 FROM files WHERE name = ?", (name,)).fetchone() is None:
             return False
         true_tags = [x[0] for x in self.con.execute("SELECT tag FROM taggings WHERE file = ?", (name,)).fetchall()]
-        logging.debug("true tags: " + str(true_tags))
-        if path[path.rindex('/')+1] == '.':
+        logging.debug("true tags: " + str(true_tags) +
+                      " given tags: " + str(tags))
+        if path[path.rindex('/')+1] != '.':
             return set(true_tags) == set(tags)
-        return set(tags).issubset(set(true_tags))
+        return set(tags) < set(true_tags)
 
     def _store_path(self, tag_path):
         return os.path.join(self.store, tag_path.split('/')[-1].lstrip('.'))
@@ -130,27 +131,31 @@ class Tagfs(Operations):
 
     def getattr(self, path, fh=None):
         logging.info("API: getattr " + path)
+        if path == "/..deleteme":
+            raise FuseOSError(errno.ENOENT)
         perm = 0o777
         # we're going to lie about the number of hardlinks we have to path (st_nlinks). 
         # internally, we should be able to get away with it because deleting tags should never delete media.
 
         full_path = self._store_path(path)
-        if path[-1] == '/' or file_name(path) not in self._files(): # we (may) have a directory
+        if path[-1] == '/' or file_name(path) not in self._files():
+            # we (may) have a directory
             for tag in dir_tags(path):
                 if tag not in self._tags():
                     logging.debug(tag + " not in " + str(self._tags()))
                     raise FuseOSError(errno.ENOENT)
             st = os.lstat(self.store)
             return {key: getattr(st, key) for key in
-                    ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
-            return 
+                    ('st_atime', 'st_ctime', 'st_gid', 'st_mode',
+                     'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
 
         st = os.lstat(full_path)
         if not self._consistent_file_path(path):
             logging.debug(path + " deemed inconsistent")
             raise FuseOSError(errno.ENOENT)
         return {key: getattr(st, key) for key in
-                ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
+                ('st_atime', 'st_ctime', 'st_gid', 'st_mode',
+                 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
 
     def readdir(self, path, fh):
         '''Implements directory listing as a generator.
@@ -168,38 +173,53 @@ class Tagfs(Operations):
         dirents = ['.', '..']
         if len(tags) == 0:
             dirents.extend(self._tags())
-            dirents.extend(self.con.execute("""SELECT CASE tag_id
-            WHEN NULL THEN name
+            file_ents = self.con.execute("""SELECT CASE
+            WHEN tag_id IS NULL THEN name
             ELSE '.' ||  name END
             FROM files LEFT JOIN file_tags ON files.id = file_tags.file_id
-            """).fetchall())
+            """).fetchall()
+            logging.debug("file ents: " + str(file_ents))
+            dirents.extend([x[0] for x in file_ents])
         else:
-            file_select = """SELECT path_tag_count.file AS file, other_tags.tag AS tag
-                FROM ( SELECT file, COUNT(tag) AS count
-                       FROM taggings WHERE tag IN ( """ + ', '.join(["?"]*len(tags)) + """ ) 
-                     ) path_tag_count
-                LEFT JOIN (SELECT tag, file FROM taggings
-                           WHERE tag NOT IN ( """ + ', '.join(["?"]*len(tags)) + """ )) other_tags
-                ON path_tag_count.file = other_tags.file
-                WHERE path_tag_count.count = ?""" # , tags + tags + [len(tags)])
+            file_select = """(
+SELECT path_tag_count.file AS file, other_tags.tag AS tag
+FROM ( SELECT file, COUNT(tag) AS count
+       FROM taggings WHERE tag IN (""" + ', '.join(["?"]*len(tags)) + """ )
+       GROUP BY file
+     ) path_tag_count
+LEFT JOIN ( SELECT tag, file
+            FROM taggings
+            WHERE tag NOT IN (
+       """ + ', '.join(["?"]*len(tags)) + """ )
+          ) other_tags
+ON path_tag_count.file = other_tags.file
+WHERE path_tag_count.count = ? )""" # , tags + tags + [len(tags)])
+            
 
             with self.con as c:
+                test_query = c.execute(file_select[1:-2],
+                                       tags + tags + [len(tags)]).fetchall()
+                logging.debug("test query: " + str(test_query))
 
-                file_ents = c.execute("""SELECT CASE tag
-                WHEN NULL THEN file
+                file_ents = c.execute("""SELECT CASE
+                WHEN tag IS NULL THEN file
                 ELSE  '.' || file END
-                FROM (SELECT file, MIN(tag) FROM ( """+ file_select + """ )
-                     ) AS unique_files""",
-                                         tags + tags + [len(tags)]).fetchall()
+                FROM ( SELECT file, tag FROM
+                """+ file_select + """
+                GROUP BY file) AS unique_files""",
+                                      tags + tags + [len(tags)]).fetchall()
                 logging.info("file ents: " + str(file_ents))
                 dirents.extend([x[0] for x in file_ents])
                 
-                tag_ents = c.execute("""SELECT CASE file
-                WHEN NULL THEN '.' || tag
-                ELSE tag END
-                FROM (SELECT name AS tag FROM tags WHERE name NOT IN ( """+ ', '.join(["?"]*len(tags)) + """ ))
-                LEFT JOIN (SELECT MIN(file), tag FROM """+ file_select +""")
-                ON name=other_tags""", tags + tags + tags + [len(tags)]).fetchall()
+                tag_ents = c.execute("""SELECT CASE
+                WHEN file IS NULL THEN '.' || other_tags.tag
+                ELSE other_tags.tag END
+                FROM (SELECT name AS tag FROM tags WHERE name NOT IN (
+                """+ ', '.join(["?"]*len(tags)) + """ )) AS other_tags
+                LEFT JOIN ( SELECT tag, file FROM
+                """+ file_select +""" AS file_select
+                          GROUP BY tag) AS file_join
+                ON other_tags.tag = file_join.tag""", tags + tags + tags + [len(tags)]).fetchall()
                 logging.info("tag ents: " + str(tag_ents))
                 dirents.extend([x[0] for x in tag_ents])
 
@@ -250,6 +270,12 @@ class Tagfs(Operations):
         logging.info("API: mkdir " + path)
         '''Create a new tag.'''
         new_tag = dir_tags(path)[-1]
+        raw = path.split('/')
+        if raw[-1] == '':
+            raw.pop()
+        raw = raw[-1]
+        if raw[0] == 0:
+            raise FuseOSError(errno.EPERM)
         if self.con.execute("SELECT 1 FROM tags WHERE name = ?", (new_tag,)).fetchone():
             raise FuseOSError(errno.EEXIST)
         with self.con as c:
@@ -263,7 +289,10 @@ class Tagfs(Operations):
         with self.con as c:
             if c.execute("SELECT 1 FROM tags WHERE name = ?", (tag,)).fetchone() is None:
                 raise FuseOSError(errno.ENOENT)
-            if c.execute("SELECT 1 FROM tags t INNER JOIN file_tags d ON t.id = d.tag_id").fetchone() is not None:
+            #if c.execute("SELECT 1 FROM tags t INNER JOIN file_tags d ON t.id = d.tag_id").fetchone() is not None:
+            if (x := c.execute("SELECT 1 FROM taggings WHERE tag = ?",
+                              (tag,)).fetchone()) is not None:
+                logging.debug("tag contains: " + str(x))
                 raise FuseOSError(errno.ENOTEMPTY)
             c.execute("DELETE FROM tags WHERE name = ?", (tag,))
 
@@ -304,7 +333,8 @@ class Tagfs(Operations):
         tags = file_tags(name)
         name = file_name(name)
         with self.con as c:
-            c.execute("INSERT INTO files (name) VALUES (?)", name)
+            c = c.cursor()
+            c.execute("INSERT INTO files (name) VALUES (?)", (name,))
             file_id = c.lastrowid
             c.executemany("""INSERT INTO file_tags (file_id, tag_id)
             SELECT ?, id FROM tags WHERE name = ?""",
@@ -326,8 +356,8 @@ class Tagfs(Operations):
                 new_tags = dir_tags(new)
                 old_tag_count = c.execute("SELECT count(name) FROM tags WHERE name IN (" +
                                           ", ".join(["?"]*len(old_tags)) + ")", old_tags).fetchall()
-                logging.info("old_tag_count: " + str(old_tag_count) + ", given old tags: " + str(old_tags))
-                if old_tag_count < len(old_tags):
+                logging.debug("old_tag_count: " + str(old_tag_count) + ", given old tags: " + str(old_tags))
+                if old_tag_count[0][0] < len(old_tags):
                     raise FuseOSError(errno.ENOENT)
                 # if someone adds extra dirs after the one they want to change, that's not covered
                 for t_old, t_new in zip(old_tags[:-1], new_tags[:-1]):
@@ -402,7 +432,9 @@ class Tagfs(Operations):
             cur = c.cursor()
             cur.execute("INSERT INTO files (name) VALUES (?)", (name,))
             id = cur.lastrowid
-            cur.executemany("INSERT INTO file_tags (file_id, tag_id) SELECT ?,id FROM tags WHERE name = ?",
+            logging.debug("RowID: " + str(id))
+            cur.executemany("""INSERT INTO file_tags (file_id, tag_id)
+            SELECT ?,id FROM tags WHERE name = ?""",
                           ((id, tag) for tag in tags))
             handle = os.open(store_path, os.O_WRONLY | os.O_CREAT, mode)
         return handle
