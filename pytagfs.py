@@ -4,9 +4,9 @@ import sys
 import fcntl
 import errno
 import time
-from sqlitedict import SqliteDict
 import logging
-import ctypes
+import sqlite3
+
 
 from fuse import FUSE, FuseOSError, Operations
 import stat
@@ -39,35 +39,68 @@ class Tagfs(Operations):
         if not os.path.exists(self.store):
             logging.info("Could not find actual store directory. Creating directory " + self.store)
             os.mkdir(self.store)
-        self.tags = SqliteDict(os.path.join(self.root, '.tags.sqlite'), autocommit=False)
-        self.contents = SqliteDict(os.path.join(self.root, '.contents.sqlite'), autocommit=False)
+        self.con = sqlite3.connect(os.path.join(self.root, '.sqlite'))
+        logging.debug("table_exists: " + str(self.con.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()))
+        with self.con as c:
+            c.execute("PRAGMA journal_mode = WAL")
+            c.execute("""CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            UNIQUE (name)
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            UNIQUE (name)
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS file_tags (
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER,
+            tag_id INTEGER,
+            FOREIGN KEY (file_id) REFERENCES files (id),
+            FOREIGN KEY (tag_id) REFERENCES tags (id)
+            )""")
+            c.execute("""CREATE VIEW IF NOT EXISTS taggings AS
+            SELECT
+                tags.name AS tag,
+                files.name AS file
+            FROM tags
+            INNER JOIN file_tags ON tags.id = file_tags.tag_id
+            INNER JOIN files ON files.id = file_tags.file_id""")
+                
+        logging.debug(self._tags())
+        pass
 
-    def __del__(self):
-        self._flush_tags()
+    def _tags(self):
+        return [x[0] for x in self.con.execute("SELECT name FROM tags").fetchall()]
+    
 
-    def _flush_tags(self):
-        self.tags.commit()
-        self.contents.commit()
-        logging.info("flushed tags and contents")
+    def _files(self):
+        return [x[0] for x in self.con.execute("SELECT name FROM files").fetchall()]
 
     def _consistent_file_path(self, path):
         name = file_name(path)
         tags = file_tags(path)
+        if self.con.execute("SELECT 1 FROM files WHERE name = ?", (name,)).fetchone() is None:
+            return False
+        true_tags = [x[0] for x in self.con.execute("SELECT tag FROM taggings WHERE file = ?", (name,)).fetchall()]
+        logging.debug("true tags: " + str(true_tags))
         if path[path.rindex('/')+1] == '.':
-            return(name in self.tags.keys() and set(tags).issubset(self.tags[name]))
-        return(name in self.tags.keys() and set(tags) == self.tags[name])
+            return set(true_tags) == set(tags)
+        return set(tags).issubset(set(true_tags))
 
     def _store_path(self, tag_path):
         return os.path.join(self.store, tag_path.split('/')[-1].lstrip('.'))
 
     def getxattr(self, path, name, *args):
         logging.info("API: getxattr " + path + ", " + str(name) + ", " +str(args))
-        if path == '/' or path.split('/')[-1].strip('.') in self.contents.keys():
-            if set(dir_tags(path)).issubset(set(self.contents.keys())):
+        if path == '/' or path.split('/')[-1].strip('.') in self._tags():
+            if set(dir_tags(path)).issubset(set(self._tags())):
                 return os.getxattr(self.store, name, *args)
             else:
                 raise FuseOSError(errno.ENOENT)
         if not self._consistent_file_path(path):
+            logging.debug(path + " deemed inconsistent")
             raise FuseOSError(errno.ENOENT)
         return os.getxattr(self._store_path(path), name, *args)
 
@@ -76,9 +109,9 @@ class Tagfs(Operations):
         logging.info("API: access " + path + " " + oct(mode))
         store_path = self._store_path(path)
         logging.debug("store path: " + store_path)
-        if path[-1] == '/' or file_name(path) not in self.tags.keys():
+        if path[-1] == '/' or file_name(path) not in self._files():
             for tag in dir_tags(path):
-                if tag not in self.contents.keys():
+                if tag not in self._tags():
                     raise FuseOSError(errno.ENOENT)
             if not os.access(self.store, mode):
                 raise FuseOSError(errno.EACCES)
@@ -102,9 +135,10 @@ class Tagfs(Operations):
         # internally, we should be able to get away with it because deleting tags should never delete media.
 
         full_path = self._store_path(path)
-        if path[-1] == '/' or file_name(path) not in self.tags.keys(): # we (may) have a directory
+        if path[-1] == '/' or file_name(path) not in self._files(): # we (may) have a directory
             for tag in dir_tags(path):
-                if tag not in self.contents.keys():
+                if tag not in self._tags():
+                    logging.debug(tag + " not in " + str(self._tags()))
                     raise FuseOSError(errno.ENOENT)
             st = os.lstat(self.store)
             return {key: getattr(st, key) for key in
@@ -113,6 +147,7 @@ class Tagfs(Operations):
 
         st = os.lstat(full_path)
         if not self._consistent_file_path(path):
+            logging.debug(path + " deemed inconsistent")
             raise FuseOSError(errno.ENOENT)
         return {key: getattr(st, key) for key in
                 ('st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid')}
@@ -125,24 +160,53 @@ class Tagfs(Operations):
         contain some of those hidden members, otherwise hidden.'''
         logging.info("API: readdir " + path)
         tags = dir_tags(path)
-        logging.debug("Path as tags: " + str(tags))
+        true_tags = self._tags()
         for tag in tags:
-            if tag not in self.contents.keys():
+            if tag not in true_tags:
                 raise FuseOSError(errno.ENOENT)
         tset = set(tags)
         dirents = ['.', '..']
-        logging.debug("Contents: " + str(dict(self.contents)))
-        logging.debug("Tags: " + str(dict(self.tags)))
         if len(tags) == 0:
-            dirents.extend(self.contents.keys())
-            dirents.extend([f if len(self.tags[f]) == 0 else '.' + f
-                            for f in os.listdir(self.store)])
+            dirents.extend(self._tags())
+            dirents.extend(self.con.execute("""SELECT CASE tag_id
+            WHEN NULL THEN name
+            ELSE '.' ||  name END
+            FROM files LEFT JOIN file_tags ON files.id = file_tags.file_id
+            """).fetchall())
         else:
-            matches = set.intersection(*[self.contents[tag] for tag in tags])
-            dirents.extend(['.' + d if len(self.contents[d].intersection(matches)) == 0 else d
-                            for d in self.contents.keys() if d not in tags])
-            dirents.extend([f if tset == self.tags[f] else '.' + f
-                            for f in matches])
+            file_select = """SELECT path_tag_count.file AS file, other_tags.tag AS tag
+                FROM ( SELECT file, COUNT(tag) AS count
+                       FROM taggings WHERE tag IN ( """ + ', '.join(["?"]*len(tags)) + """ ) 
+                     ) path_tag_count
+                LEFT JOIN (SELECT tag, file FROM taggings
+                           WHERE tag NOT IN ( """ + ', '.join(["?"]*len(tags)) + """ )) other_tags
+                ON path_tag_count.file = other_tags.file
+                WHERE path_tag_count.count = ?""" # , tags + tags + [len(tags)])
+
+            with self.con as c:
+
+                file_ents = c.execute("""SELECT CASE tag
+                WHEN NULL THEN file
+                ELSE  '.' || file END
+                FROM (SELECT file, MIN(tag) FROM ( """+ file_select + """ )
+                     ) AS unique_files""",
+                                         tags + tags + [len(tags)]).fetchall()
+                logging.info("file ents: " + str(file_ents))
+                dirents.extend([x[0] for x in file_ents])
+                
+                tag_ents = c.execute("""SELECT CASE file
+                WHEN NULL THEN '.' || tag
+                ELSE tag END
+                FROM (SELECT name AS tag FROM tags WHERE name NOT IN ( """+ ', '.join(["?"]*len(tags)) + """ ))
+                LEFT JOIN (SELECT MIN(file), tag FROM """+ file_select +""")
+                ON name=other_tags""", tags + tags + tags + [len(tags)]).fetchall()
+                logging.info("tag ents: " + str(tag_ents))
+                dirents.extend([x[0] for x in tag_ents])
+
+            
+        logging.debug('finished making dir listing')
+        for r in dirents:
+            logging.debug(str(r))
         for r in dirents:
             yield r
 
@@ -155,7 +219,6 @@ class Tagfs(Operations):
         if path_from_store[0] == '/':
             pathname = path_from_store
         else:
-            #pathname = os.path.join("../"*(read_dir.count('/')), self.store, path_from_store)
             pathname = os.path.join(os.path.relpath(self.store, read_dir),
                                     path_from_store)
             pathname = os.path.normpath(pathname)
@@ -163,46 +226,49 @@ class Tagfs(Operations):
         return pathname
 
     def mknod(self, path, mode, dev):
-        logging.info("API: mknod")
+        logging.info("API: mknod " + path)
         '''Generates a normal file (not folder-tag).
         Uses the path to set initial tags.'''
-        # FIXME check to make sure this file doesn't exist.
-        tags = [t.strip() for t in path.split('/')[0:-1]]
-        name = path.split('/')[-1].strip()
-        self.tags[name] = set(tags)
-        for tag in tags:
-            self.contents[tag].add(name)
-        self._flush_tags()
-        # return the link to the new store file
-        return os.mknod(self._store_path(path), mode, dev)
+
+        name = file_name(path)
+        if con.execute("SELECT 1 FROM files WHERE name = ?", (name,)).fetchone():
+            # possibly odd behavior to not overwrite, might need to be changed
+            raise FuseOSError(errno.EEXIST)
+        for val in executemany("SELECT 1 FROM tags WHERE name = ?", tags):
+            if val is None:
+                raise FuseOSError(errno.ENOENT)
+        tags = file_tags(path)
+        with self.con as c:
+            c.execute("INSERT INTO files (name) VALUES ('?')", (name,))
+            file_id = c.lastrowid
+            self.con.executemany("INSERT INTO file_tags (file_id, tag_id) SELECT '?',id FROM tags WHERE name = ?",
+                                 ((file_id, tag) for tag in tags))
+            retval = os.mknod(self._store_path(path), mode, dev)
+        return retval
 
     def mkdir(self, path, mode):
-        logging.info("API: mkdir")
+        logging.info("API: mkdir " + path)
         '''Create a new tag.'''
-        new_tag = path.split('/')[-1].strip("/.")
-        self.contents[new_tag] = set()
-        self._flush_tags()
+        new_tag = dir_tags(path)[-1]
+        if self.con.execute("SELECT 1 FROM tags WHERE name = ?", (new_tag,)).fetchone():
+            raise FuseOSError(errno.EEXIST)
+        with self.con as c:
+            c.execute("INSERT INTO tags (name) VALUES (?)", (new_tag,))
 
     def rmdir(self, path):
         '''Deletes an empty tag.'''
         logging.info("API: rmdir " + path)
-        # check we don't have a leaf
-        # if os.path.isfile(_store_path(path)):
-        #     raise OSError(20, "Not a tag")
-        tag = path.split('/')[-1].strip() # note: it better be hidden or we'll throw 39
-        # check we are trying to delete a real tag
-        if tag not in self.contents.keys():
-            raise FuseOSError(errno.ENOENT)
-        # check that the tag has no members anywhere
-        if self.contents[tag] != set():
-            raise FuseOSError(errno.ENOTEMPTY)
-        # remove it (it's not in any tags)
-        del self.contents[tag]
-        # return none
-        self._flush_tags()
+        tag = dir_tags(path)[-1]
+
+        with self.con as c:
+            if c.execute("SELECT 1 FROM tags WHERE name = ?", (tag,)).fetchone() is None:
+                raise FuseOSError(errno.ENOENT)
+            if c.execute("SELECT 1 FROM tags t INNER JOIN file_tags d ON t.id = d.tag_id").fetchone() is not None:
+                raise FuseOSError(errno.ENOTEMPTY)
+            c.execute("DELETE FROM tags WHERE name = ?", (tag,))
 
     def statfs(self, path):
-        logging.info("API: statfs")
+        logging.info("API: statfs " + path)
         # does this break on directories?
         full_path = self._store_path(path)
         stv = os.statvfs(full_path)
@@ -215,16 +281,16 @@ class Tagfs(Operations):
         store_path = self._store_path(path)
         name = file_name(path)
         if len(tags := file_tags(path)) != 0 and self.flat_delete:
-            tag = tags[-1]
-            self.tags[name] = self.tags[name] - {tag}
-            self.contents[tag] = self.contents[tag] - {name}
-            self._flush_tags()
+            self.con.execute("""DELETE FROM file_tags WHERE
+            tag_id = (SELECT id FROM tags WHERE name = ?) AND
+            file_id = (SELECT id FROM files WHERE name = ?)""",
+                             (tags[-1], name))
             return
-        os.unlink(store_path)
-        for tag in self.tags[name]:
-            self.contents[tag] = self.contents[tag] - {name}
-        del self.tags[name]
-        self._flush_tags()
+        with self.con as c:
+            c.execute("""DELETE FROM file_tags WHERE
+            file_id = (SELECT id FROM files WHERE name = ?)""", (name,))
+            c.execute("DELETE FROM files WHERE name = ?", (name,))
+            os.unlink(store_path)
 
     def symlink(self, name, target):
         '''Creates a symlink.  You shouldn't need as many inside this filesystem.'''
@@ -234,15 +300,16 @@ class Tagfs(Operations):
         if target[0] != '/':
             target = os.path.join(os.path.relpath(self.mount, self.store),
                                   target)
-        retval = os.symlink(target, self._store_path(name))
-        logging.debug("continuing after attempting to symlink with result " + str(retval))
         # add the tags we need
         tags = file_tags(name)
         name = file_name(name)
-        self.tags[name] = set(tags)
-        for tag in tags:
-            self.contents[tag] = self.contents[tag].union({name})
-        self._flush_tags()
+        with self.con as c:
+            c.execute("INSERT INTO files (name) VALUES (?)", name)
+            file_id = c.lastrowid
+            c.executemany("""INSERT INTO file_tags (file_id, tag_id)
+            SELECT ?, id FROM tags WHERE name = ?""",
+                          ((file_id, tag) for tag in tags))
+            retval = os.symlink(target, self._store_path(name))
         return retval
 
     def rename(self, old, new):
@@ -251,84 +318,68 @@ class Tagfs(Operations):
         old_name = file_name(old)
         new_name = file_name(new)
         # are we dealing with a file or a folder?
-        #if old[-1] == '/' or not os.path.exists(self._store_path(old)):
-        if old[-1] == '/' or file_name(old) not in self.tags.keys():
-            # we are dealing with a (potentially bad) directory
-            logging.debug("renaming as directory")
-            old_tags = dir_tags(old)
-            new_tags = dir_tags(new)
-            if old_tags[-1] not in self.contents.keys():
-                raise FuseOSError(errno.ENOENT)
-            # if someone adds extra dirs after the one they want to change, that's not covered
-            for t_old, t_new in zip(old_tags[:-1], new_tags[:-1]):
-                if t_old != t_new:
-                    raise FuseOSError(errno.ENOSYS)
-            old_tag = old_tags[-1]
-            new_tag = new_tags[-1]
-            if len(old_tags) == 1 and new == "/..deleteme": # magic dir name to delete a tag from windows
-                self.rmdir(old)
-                return
-            if new_tag in self.contents.keys():
-                raise FuseOSError(errno.EEXIST)
-            self.contents[new_tag] = self.contents.pop(old_tag)
-            for f in self.contents[new_tag]:
-                self.tags[f] = self.tags[f] - {old_tag}
-                self.tags[f] = self.tags[f].union({new_tag})
-            self._flush_tags()
-        else:
-            logging.debug("renaming as file")
-            # handle taglist change
-            if (from_tags := set(file_tags(old))) != (to_tags := set(file_tags(new))):
-                old_tags = self.tags[old_name]
-                if from_tags == set() or old.split('/')[-1][0] == ".":
-                    new_tags = old_tags.union(to_tags)
-                else:
-                    new_tags = to_tags
+        with self.con as c:
+            if old[-1] == '/' or c.execute("SELECT 1 FROM files WHERE name = ?", (old_name,)).fetchone() is None:
+                # we are dealing with a (potentially bad) directory
+                logging.debug("renaming as directory")
+                old_tags = dir_tags(old)
+                new_tags = dir_tags(new)
+                old_tag_count = c.execute("SELECT count(name) FROM tags WHERE name IN (" +
+                                          ", ".join(["?"]*len(old_tags)) + ")", old_tags).fetchall()
+                logging.info("old_tag_count: " + str(old_tag_count) + ", given old tags: " + str(old_tags))
+                if old_tag_count < len(old_tags):
+                    raise FuseOSError(errno.ENOENT)
+                # if someone adds extra dirs after the one they want to change, that's not covered
+                for t_old, t_new in zip(old_tags[:-1], new_tags[:-1]):
+                    if t_old != t_new:
+                        raise FuseOSError(errno.ENOSYS)
+                old_tag = old_tags[-1]
+                new_tag = new_tags[-1]
+                if len(old_tags) == 1 and new == "/..deleteme": # magic dir name to delete a tag from windows
+                    self.rmdir(old)
+                    return
+                if c.execute("SELECT 1 FROM tags WHERE name = ?", (new_tag,)).fetchone() is not None:
+                    raise FuseOSError(errno.EEXIST)
+                c.execute("UPDATE tags SET name = ? WHERE name = ?", (new_tag, old_tag))
+            else:
+                logging.debug("renaming as file")
+                # handle taglist change
+                if set(from_tags := file_tags(old)) != set(to_tags := file_tags(new)):
+                    if not self._consistent_file_path(old):
+                        logging.debug(path + " deemed inconsistent")
+                        raise FuseOSError(errno.ENOENT)
+                    if len(from_tags) == 0 or old.split('/')[-1][0] == ".": # add only
+                        c.executemany("""INSERT OR IGNORE INTO file_tags (file_id, tag_id)
+                        SELECT f.id, t.id FROM files AS f CROSS JOIN tags AS t
+                        WHERE f.name = ? AND t.name = ?""", ((old_name, tag) for tag in to_tags))
+                    else:
+                        c.execute("""DELETE FROM file_tags WHERE
+                        file_id = (SELECT id FROM files WHERE name = ?)""", (old_name,))
+                        c.executemany("""INSERT INTO file_tags (file_id, tag_id)
+                        SELECT f.id, t.id FROM files AS f CROSS JOIN tags AS t
+                        WHERE f.name = ? AND t.name = ?""", ((old_name, tag) for tag in to_tags))
 
-                removed_tags = old_tags - new_tags
-                added_tags = new_tags - old_tags
-                logging.debug("changing tags: " + str(list(old_tags)) + " - " + str(list(removed_tags)) +
-                                                    " + " + str(list(added_tags)) +
-                                                    " = " + str(list(new_tags)))
-                self.tags[old_name] = new_tags
-                for tag in removed_tags:
-                    self.contents[tag] = self.contents[tag] - {old_name}
-                for tag in added_tags:
-                    self.contents[tag] = self.contents[tag].union({old_name})
-                logging.debug("contents: " + str(dict(self.contents)))
-            # handle filename change
-            if old_name != new_name:
-                logging.debug("changing name")
-                old_path = self._store_path(old)
-                new_path = self._store_path(new)
-                os.rename(old_path, new_path)
-                self.tags[new_name] = self.tags.pop(old_name)
-                for tag in file_tags(new):
-                    self.contents[tag].remove(old_name)
-                    self.contents[tag].add(new_name)
-            self._flush_tags()
-
-        
+                # handle filename change
+                if old_name != new_name:
+                    old_path = self._store_path(old)
+                    new_path = self._store_path(new)
+                    c.execute("UPDATE files SET name = ? WHERE name = ?", (new_name, old_name))
+                    os.rename(old_path, new_path)
 
     def link(self, target, name):
-        '''Hardlink: union tags'''
-        logging.info("API: link")
-        # refuse if the file name is different
-        if _store_path(target) != _store_path(name):
-            raise OSError(38, "hardlinking different names for an item not allowed")
-        # make a set of old tags
-        old_tags = set(target.split("/")[0:-2])
-        # make a set of new tags
-        new_tags = {x.strip('.') for x in name.split("/")}
-        # union
-        sum_tags = old_tags.union(new_tags)
-        # set contents
-        fname = file_name(name)
-        self.tags[fname] |= new_tags
-        # set tags
-        for tag in sum_tags:
-            self.contents[tag].add(name)
-        self._flush_tags()
+        if not self._consistent_file_name(target):
+            logging.debug(path + " deemed inconsistent")
+            raise FuseOSError(errno.ENOENT)
+        if file_name(target) != file_name(name):
+            raise FuseOSError(errno.EPERM)
+        with self.con as c:
+            for v in c.executemany("SELECT 1 FROM tags WHERE name = ?", ((x,) for x in file_tags(name))).fetchall():
+                if v is None:
+                    raise FuseOSError(errno.ENOENT)
+            c.executemany("""INSERT OR IGNORE INTO file_tags (file_id, tag_id)
+            SELECT f.id, t.id FROM files AS f CROSS JOIN tags AS t
+            WHERE f.name = ? AND t.name = ?""", ((file_name(name), tag) for tag in file_tags(name)))
+            
 
     def utimens(self, path, times=None):
         logging.info("API: utimens " + path)
@@ -346,13 +397,16 @@ class Tagfs(Operations):
         store_path = self._store_path(path)
         tags = file_tags(path)
         name = file_name(path)
-        self.tags[name]=set(tags)
-        for tag in tags:
-            self.contents[tag] = self.contents[tag].union({name})
-        self._flush_tags()
-        handle = os.open(store_path, os.O_WRONLY | os.O_CREAT, mode)
-        logging.debug("Opened handle: " + str(handle))
+
+        with self.con as c:
+            cur = c.cursor()
+            cur.execute("INSERT INTO files (name) VALUES (?)", (name,))
+            id = cur.lastrowid
+            cur.executemany("INSERT INTO file_tags (file_id, tag_id) SELECT ?,id FROM tags WHERE name = ?",
+                          ((id, tag) for tag in tags))
+            handle = os.open(store_path, os.O_WRONLY | os.O_CREAT, mode)
         return handle
+
     def read(self, path, length, offset, fh):
         logging.info("API: read " + path)
         os.lseek(fh, offset, os.SEEK_SET)
