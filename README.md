@@ -1,7 +1,7 @@
 # PyTagFS
 PyTagFS is a tag-based filesystem written in Python. Instead of directories being 'containers,' they represent attributes, so they can be accessed in any order. It's intended for organizing diverse media collections.  You'll never forget whether you put that picture of a sunset with a whale breaching in `~/Pictures/landscapes/sunsets` or `~/Pictures/animals/wild` again!
 
-This is early beta software. EXPECT IT TO LOSE YOUR DATA. I only put symlinks in, so my actual files stay safe.
+This is early beta software. Keep backups of your backend folder. I only put symlinks in, so my actual files stay safe.
 
 This is an unusual file system, which might cause file managers to make more low-level filesystem calls than usual, which may increase disk wear.
 ## Usage
@@ -10,7 +10,7 @@ Start pytagfs with:
 ```$ pytagfs -m <mountpoint> -d <datastore folder> [-o <comma-separated filesystem args>] [<flag>...]```
 Make sure that `mountpoint` and `datastore folder` refer to folders which exist, that the datastore folder is not inside the mountpoint, and is empty the first time you run the command.
 
-For most usage, you shouldn't need any flags other than maybe `-o allow_other` if you are sharing the filesystem over SMB. Please collect logs with the `-v -s` and then `-vv` options and raise an issue if you notice something that doesn't work the way it should.
+For most usage, you shouldn't need any flags other than maybe `-o allow_other` and `-l <limit>` (more on that later) if you are sharing the filesystem over SMB, SSHFS, etc. Please collect logs with the `-v -s` and then `-vv` options and raise an issue if you notice something that doesn't work the way it should.
 
 ### Basic Usage
 
@@ -25,6 +25,12 @@ You may not have multiple files anywhere in one tag filesystem with the same nam
 File and tag names may not start or end with a `.`. There is no way to choose whether a file or tag is displayed hidden or not.
 
 Stopping or restarting a FUSE mountpoint locks up any shells currently working inside it.
+
+If you started with version 0.0.1 and are upgrading to version 0.0.2, you'll need to manually add a table constraint. Raise an issue and I'll make a script for this; I don't think anyone other than myself is affected.
+
+### Limit
+
+New in version 0.0.2 is a `-l` option for adding a limit to the number of hidden files listed in the outermost directory.  This improves performance massively if you use this option.  I like `-l 20` for 20 hidden items with any tags, but you might prefer to set it to 0 so you aren't wondering where a _specific_ file is.
 
 ### Hidden Files
 
@@ -55,13 +61,14 @@ Requirements: FUSE. That means pytagfs only supports Unix-like systems.
 
 ```pip install pytagfs```
 
+## Known Bugs
+- Symlinks not always shown in all tag configurations under SMB.
 
 ## Wish List
 - [x] Basic functionality
   - [x] CRUD operations
   - [x] Must work with file managers and over SMB
 - [ ] Odds and Ends
-  - [ ] Add options to limit the number of hidden files you list (for large media collections).
   - [ ] Consider giving tags their own inodes or otherwise managing permissions, attrs, xattrs
   - [ ] Consider turning files into sqlite blobs
   - [ ] If you have experience with SQL, consider checking over my queries.
