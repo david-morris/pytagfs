@@ -29,10 +29,11 @@ def file_name(path):
     return path.split('/')[-1].strip('.')
 
 class Tagfs(Operations):
-    def __init__(self, root, mount, flat_delete):
+    def __init__(self, root, mount, flat_delete, hidden_limit):
         logging.info("init on "+ root)
         self.root = root
         self.mount = mount
+        self.hidden_limit = hidden_limit
         self.flat_delete = flat_delete
         self.store = os.path.join(self.root, 'store')
         # check to make sure we have a valid store structure
@@ -58,7 +59,8 @@ class Tagfs(Operations):
             file_id INTEGER,
             tag_id INTEGER,
             FOREIGN KEY (file_id) REFERENCES files (id),
-            FOREIGN KEY (tag_id) REFERENCES tags (id)
+            FOREIGN KEY (tag_id) REFERENCES tags (id),
+            UNIQUE (file_id, tag_id)
             )""")
             c.execute("""CREATE VIEW IF NOT EXISTS taggings AS
             SELECT
@@ -173,11 +175,23 @@ class Tagfs(Operations):
         dirents = ['.', '..']
         if len(tags) == 0:
             dirents.extend(self._tags())
-            file_ents = self.con.execute("""SELECT CASE
-            WHEN tag_id IS NULL THEN name
-            ELSE '.' ||  name END
-            FROM files LEFT JOIN file_tags ON files.id = file_tags.file_id
-            """).fetchall()
+            if self.hidden_limit == -1:
+                logging.debug("No hidden limit.")
+                file_ents = self.con.execute("""SELECT CASE
+                WHEN tag_id IS NULL THEN name
+                ELSE '.' ||  name END
+                FROM files LEFT JOIN file_tags ON files.id = file_tags.file_id
+                """).fetchall()
+            else:
+                logging.debug("Hidden limit: " + str(self.hidden_limit))
+                file_ents = self.con.execute("""SELECT name
+                FROM files LEFT JOIN file_tags ON files.id = file_tags.file_id
+                WHERE tag_id IS NULL
+                UNION
+                SELECT '.' || name FROM 
+                files LEFT JOIN file_tags ON files.id = file_tags.file_id
+                WHERE tag_id IS NOT NULL
+                LIMIT ?""", (self.hidden_limit,))
             logging.debug("file ents: " + str(file_ents))
             dirents.extend([x[0] for x in file_ents])
         else:
@@ -397,6 +411,7 @@ WHERE path_tag_count.count = ? )""" # , tags + tags + [len(tags)])
                     os.rename(old_path, new_path)
 
     def link(self, target, name):
+        logging.info("API: link " + target + " to " + name)
         if not self._consistent_file_name(target):
             logging.debug(path + " deemed inconsistent")
             raise FuseOSError(errno.ENOENT)
@@ -468,9 +483,9 @@ WHERE path_tag_count.count = ? )""" # , tags + tags + [len(tags)])
         return self.flush(path, fh)
 
 
-def main(mountpoint, root, options, flat_delete):
+def main(mountpoint, root, options, flat_delete, limit):
     logging.info("Mountpoint: "+ str(mountpoint)+ ", root: "+ str(root))
-    FUSE(Tagfs(root, mountpoint, flat_delete), mountpoint, nothreads=True, foreground=True, **options)
+    FUSE(Tagfs(root, mountpoint, flat_delete, limit), mountpoint, nothreads=True, foreground=True, **options)
 
 if __name__ == '__main__':
     parser = OptionParser()
@@ -486,6 +501,8 @@ if __name__ == '__main__':
                       help="FUSE filesystem options")
     parser.add_option("-a", "--anywhere-delete", dest="flat_delete", action="store_false", default=True,
                       help="allow deletion anywhere, instead of just in the root of the fileystem")
+    parser.add_option("-l", "--limit", dest="limit", type="int", default=-1,
+                      help="set a limit to the number of hidden files to list in the root of the mount")
     options, args = parser.parse_args()
     if options.verbosity > 0:
         logging.root.setLevel(logging.INFO)
@@ -504,4 +521,4 @@ if __name__ == '__main__':
         logging.info("FS options: " + str(kwargs))
     else:
         kwargs = {}
-    main(options.mountpoint, options.datastore, kwargs, options.flat_delete)
+    main(options.mountpoint, options.datastore, kwargs, options.flat_delete, options.limit)
