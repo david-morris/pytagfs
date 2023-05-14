@@ -14,7 +14,7 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/david-morris/pytagfs",
-    install_requires=['fusepy'],
+    install_requires=['fusepy', 'sqlalchemy>=2.0.0'],
     classifiers=[
         "Programming Language :: Python :: 3",
         "Development Status :: 2 - Pre-Alpha",
